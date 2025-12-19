@@ -1,25 +1,24 @@
 package com.example.roonplayer.api
 
 import android.content.SharedPreferences
-import android.widget.EditText
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import com.example.roonplayer.network.SimpleWebSocketClient
 
 /**
  * RoonApiSettings - 基于官方RoonCoverArt实现的Settings管理类
  * 参考：https://github.com/epochaudio/RoonCoverArt/blob/main/app.js
  */
 class RoonApiSettings(
-    private var webSocketClient: SimpleWebSocketClient?,
-    private val ipInput: EditText,
+    private val getHostInput: () -> String,
     private val sharedPreferences: SharedPreferences,
     private val onZoneConfigChanged: (String?) -> Unit,
     private val getAvailableZones: () -> Map<String, JSONObject>
 ) {
     companion object {
         private const val TAG = "RoonApiSettings"
+        private const val OUTPUT_ID_KEY = "roon_output_id"
+        private const val ZONE_CONFIG_KEY = "configured_zone"
     }
     
     private var currentSettings = mutableMapOf<String, Any>()
@@ -27,13 +26,6 @@ class RoonApiSettings(
     init {
         // 加载保存的设置
         loadSavedSettings()
-    }
-    
-    /**
-     * 更新WebSocket客户端引用
-     */
-    fun updateWebSocketClient(client: SimpleWebSocketClient?) {
-        webSocketClient = client
     }
     
     /**
@@ -116,8 +108,7 @@ class RoonApiSettings(
                     Log.d(TAG, "Zone selected: $zoneId (from output: $outputId)")
                     onZoneConfigChanged(zoneId)
                 } else {
-                    Log.d(TAG, "Output selected: $outputId")
-                    onZoneConfigChanged(outputId)
+                    Log.w(TAG, "Output selected but zone not available yet: $outputId")
                 }
             }
         }
@@ -213,8 +204,13 @@ class RoonApiSettings(
      * 加载保存的设置
      */
     private fun loadSavedSettings() {
-        val hostInput = ipInput.text.toString().trim()
-        val savedOutput = sharedPreferences.getString("roon_zone_id_$hostInput", null)
+        val hostInput = getHostInput().trim()
+        val savedOutput = sharedPreferences.getString(OUTPUT_ID_KEY, null)
+            ?: if (hostInput.isNotEmpty()) {
+                sharedPreferences.getString("roon_zone_id_$hostInput", null)
+            } else {
+                null
+            }
         
         if (savedOutput != null) {
             // 创建output对象
@@ -224,6 +220,12 @@ class RoonApiSettings(
             }
             currentSettings["output"] = outputObj
             Log.d(TAG, "Loaded saved output: $savedOutput")
+
+            if (savedOutput != sharedPreferences.getString(OUTPUT_ID_KEY, null)) {
+                sharedPreferences.edit()
+                    .putString(OUTPUT_ID_KEY, savedOutput)
+                    .apply()
+            }
         }
     }
     
@@ -231,8 +233,6 @@ class RoonApiSettings(
      * 保存设置到SharedPreferences
      */
     private fun persistSettings() {
-        val hostInput = ipInput.text.toString().trim()
-        
         // 保存output设置
         val outputObj = currentSettings["output"] as? JSONObject
         val outputId = outputObj?.optString("output_id")
@@ -240,18 +240,15 @@ class RoonApiSettings(
             // 找到对应的zone_id
             val zoneId = findZoneIdByOutputId(outputId)
             if (zoneId != null) {
-                // 使用Core ID保存Zone配置
-                val coreId = getCurrentCoreId()
-                if (coreId != null) {
-                    sharedPreferences.edit()
-                        .putString("configured_zone_$coreId", zoneId)
-                        .apply()
-                    Log.d(TAG, "Saved zone configuration: $zoneId (Core: $coreId)")
-                }
+                sharedPreferences.edit()
+                    .putString(ZONE_CONFIG_KEY, zoneId)
+                    .apply()
+                Log.d(TAG, "Saved zone configuration: $zoneId")
             }
-            // 兼容性：也保存旧格式
+
+            // 保存output_id用于Settings界面回填
             sharedPreferences.edit()
-                .putString("roon_zone_id_$hostInput", outputId)
+                .putString(OUTPUT_ID_KEY, outputId)
                 .apply()
             Log.d(TAG, "Saved output setting: $outputId")
         }
@@ -260,9 +257,10 @@ class RoonApiSettings(
     /**
      * 获取当前Roon Core ID
      */
-    private fun getCurrentCoreId(): String? {
-        val hostInput = ipInput.text.toString().trim()
-        return sharedPreferences.getString("roon_core_id_$hostInput", null) ?: hostInput
+    private fun getLegacyCoreId(): String? {
+        val hostInput = getHostInput().trim()
+        if (hostInput.isEmpty()) return null
+        return sharedPreferences.getString("roon_core_id_$hostInput", null)
     }
     
     /**
@@ -302,10 +300,45 @@ class RoonApiSettings(
      * 加载Zone配置
      */
     fun loadZoneConfiguration(): String? {
-        val hostInput = ipInput.text.toString().trim()
-        val zoneId = sharedPreferences.getString("roon_zone_id_$hostInput", null)
-        Log.d(TAG, "Loaded zone configuration: zoneId=$zoneId")
-        return zoneId
+        val existingZone = sharedPreferences.getString(ZONE_CONFIG_KEY, null)
+        if (existingZone != null) {
+            Log.d(TAG, "Loaded zone configuration: zoneId=$existingZone")
+            return existingZone
+        }
+
+        val legacyCoreId = getLegacyCoreId()
+        val legacyCoreKey = legacyCoreId?.let { "configured_zone_$it" }
+        val legacyZone = legacyCoreKey?.let { sharedPreferences.getString(it, null) }
+        if (legacyZone != null) {
+            sharedPreferences.edit()
+                .putString(ZONE_CONFIG_KEY, legacyZone)
+                .remove(legacyCoreKey)
+                .apply()
+            Log.d(TAG, "Migrated zone configuration: zoneId=$legacyZone")
+            return legacyZone
+        }
+
+        val hostInput = getHostInput().trim()
+        val legacyOutput = sharedPreferences.getString(OUTPUT_ID_KEY, null)
+            ?: if (hostInput.isNotEmpty()) {
+                sharedPreferences.getString("roon_zone_id_$hostInput", null)
+            } else {
+                null
+            }
+
+        if (legacyOutput != null) {
+            val zoneId = findZoneIdByOutputId(legacyOutput)
+            if (zoneId != null) {
+                sharedPreferences.edit()
+                    .putString(ZONE_CONFIG_KEY, zoneId)
+                    .apply()
+                Log.d(TAG, "Mapped output to zone: zoneId=$zoneId")
+                return zoneId
+            }
+        }
+
+        Log.d(TAG, "Loaded zone configuration: zoneId=null")
+        return null
     }
     
     /**
