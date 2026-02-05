@@ -46,6 +46,10 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import com.example.roonplayer.api.RoonApiSettings
+import com.example.roonplayer.api.ZoneConfigRepository
+import com.example.roonplayer.domain.AutoReconnectPolicy
+import com.example.roonplayer.domain.InFlightOperationGuard
+import com.example.roonplayer.domain.ZoneSelectionUseCase
 import com.example.roonplayer.network.RoonConnectionValidator
 import com.example.roonplayer.network.SimplifiedConnectionHelper
 import com.example.roonplayer.network.SmartConnectionManager
@@ -59,8 +63,6 @@ class MainActivity : Activity() {
     companion object {
         private const val PERMISSION_REQUEST_CODE = 123
         private const val MAX_CACHED_IMAGES = 900
-        private const val ZONE_CONFIG_KEY = "configured_zone"
-        private const val OUTPUT_ID_KEY = "roon_output_id"
         private val REQUIRED_PERMISSIONS = arrayOf(
             android.Manifest.permission.ACCESS_FINE_LOCATION,
             android.Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -80,7 +82,7 @@ class MainActivity : Activity() {
         // Extension registration constants
         private const val EXTENSION_ID = "com.epochaudio.coverartandroid"
         private const val DISPLAY_NAME = "CoverArt_Android"
-        private const val DISPLAY_VERSION = "Android_FrameArt_2.17"
+        private const val DISPLAY_VERSION = "2.17"
         private const val PUBLISHER = "门耳朵制作"
         private const val EMAIL = "wuzhengdong12138@gmail.com"
     }
@@ -244,42 +246,26 @@ class MainActivity : Activity() {
         if (DEBUG_ENABLED) android.util.Log.e(LOG_TAG, message, e)
     }
     
-    // UI State management system
-    private data class UIState(
-        val trackText: String = "无音乐播放",
-        val artistText: String = "无艺术家", 
-        val albumText: String = "无专辑",
-        val statusText: String = "未连接到Roon",
-        val albumBitmap: Bitmap? = null
-    )
-    
-    private var uiState = UIState()
-    
     private fun saveUIState() {
         logDebug("💾 Saving UI state...")
-        uiState = UIState(
-            trackText = if (::trackText.isInitialized) trackText.text.toString() else uiState.trackText,
-            artistText = if (::artistText.isInitialized) artistText.text.toString() else uiState.artistText,
-            albumText = if (::albumText.isInitialized) albumText.text.toString() else uiState.albumText,
-            statusText = if (::statusText.isInitialized) statusText.text.toString() else uiState.statusText,
-            albumBitmap = getCurrentAlbumBitmap()
-        )
-        logDebug("📝 UI state saved - Track: '${uiState.trackText}', Artist: '${uiState.artistText}'")
+        stateLock.withLock {
+            val oldState = currentState.get()
+            val snapshotState = oldState.copy(
+                trackText = if (::trackText.isInitialized) trackText.text.toString() else oldState.trackText,
+                artistText = if (::artistText.isInitialized) artistText.text.toString() else oldState.artistText,
+                albumText = if (::albumText.isInitialized) albumText.text.toString() else oldState.albumText,
+                statusText = if (::statusText.isInitialized) statusText.text.toString() else oldState.statusText,
+                albumBitmap = if (::albumArtView.isInitialized) getCurrentAlbumBitmap() else oldState.albumBitmap,
+                timestamp = System.currentTimeMillis()
+            )
+            currentState.set(snapshotState)
+            logDebug("📝 UI state saved - Track: '${snapshotState.trackText}', Artist: '${snapshotState.artistText}'")
+        }
     }
     
     private fun restoreUIState() {
         logDebug("♻️ Restoring UI state...")
-        if (::statusText.isInitialized) statusText.text = uiState.statusText
-        if (::trackText.isInitialized) trackText.text = uiState.trackText
-        if (::artistText.isInitialized) artistText.text = uiState.artistText
-        if (::albumText.isInitialized) albumText.text = uiState.albumText
-        
-        uiState.albumBitmap?.let { bitmap ->
-            if (::albumArtView.isInitialized) {
-                albumArtView.setImageBitmap(bitmap)
-                updateBackgroundColor(bitmap)
-            }
-        }
+        renderState(currentState.get())
         logDebug("✅ UI state restored successfully")
     }
     
@@ -297,7 +283,35 @@ class MainActivity : Activity() {
         }
     }
     
+    private fun runOnMainThread(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+        } else {
+            mainHandler.post { action() }
+        }
+    }
+
+    private fun renderState(state: TrackState) {
+        if (::statusText.isInitialized) statusText.text = state.statusText
+        if (::trackText.isInitialized) trackText.text = state.trackText
+        if (::artistText.isInitialized) artistText.text = state.artistText
+        if (::albumText.isInitialized) albumText.text = state.albumText
+
+        if (::albumArtView.isInitialized) {
+            if (state.albumBitmap != null) {
+                albumArtView.setImageBitmap(state.albumBitmap)
+                updateBackgroundColor(state.albumBitmap)
+            } else {
+                albumArtView.setImageResource(android.R.color.darker_gray)
+            }
+        }
+    }
+
     private fun updateTrackInfo(track: String, artist: String, album: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnMainThread { updateTrackInfo(track, artist, album) }
+            return
+        }
         stateLock.withLock {
             val newState = currentState.get().copy(
                 trackText = track,
@@ -306,8 +320,7 @@ class MainActivity : Activity() {
                 timestamp = System.currentTimeMillis()
             )
             currentState.set(newState)
-            
-            uiState = uiState.copy(trackText = track, artistText = artist, albumText = album)
+
             if (::trackText.isInitialized) trackText.text = track
             if (::artistText.isInitialized) artistText.text = artist
             if (::albumText.isInitialized) albumText.text = album
@@ -316,6 +329,10 @@ class MainActivity : Activity() {
     }
     
     private fun updateAlbumImage(bitmap: Bitmap?, imageUri: String? = null) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnMainThread { updateAlbumImage(bitmap, imageUri) }
+            return
+        }
         stateLock.withLock {
             val newState = currentState.get().copy(
                 albumBitmap = bitmap,
@@ -325,20 +342,16 @@ class MainActivity : Activity() {
             currentState.set(newState)
             
             // Update UI components
-            bitmap?.let {
-                if (::albumArtView.isInitialized) {
-                    albumArtView.setImageBitmap(it)
-                    updateBackgroundColor(it)
+            if (::albumArtView.isInitialized) {
+                if (bitmap != null) {
+                    albumArtView.setImageBitmap(bitmap)
+                    updateBackgroundColor(bitmap)
+                } else {
+                    albumArtView.setImageResource(android.R.color.darker_gray)
                 }
-                uiState = uiState.copy(albumBitmap = it)
             }
             
         }
-    }
-    
-    private fun setUIStatus(status: String) {
-        uiState = uiState.copy(statusText = status)
-        if (::statusText.isInitialized) statusText.text = status
     }
     
     private lateinit var statusText: TextView
@@ -353,6 +366,7 @@ class MainActivity : Activity() {
     private var webSocketClient: SimpleWebSocketClient? = null
     private val connectionValidator = RoonConnectionValidator()
     private val connectionHelper = SimplifiedConnectionHelper(connectionValidator)
+    private val zoneSelectionUseCase = ZoneSelectionUseCase()
     
     // Manual CoroutineScope bound to Activity lifecycle
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -361,11 +375,15 @@ class MainActivity : Activity() {
     private lateinit var healthMonitor: ConnectionHealthMonitor
     private var requestId = 1
     private val infoRequestSent = AtomicBoolean(false)
+    private val connectionGuard = InFlightOperationGuard()
+    private val discoveryGuard = InFlightOperationGuard()
+    private val autoReconnectPolicy = AutoReconnectPolicy()
     private val mainHandler = Handler(Looper.getMainLooper())
     
     // 发现相关
     private val discoveredCores = ConcurrentHashMap<String, RoonCoreInfo>()
     private lateinit var sharedPreferences: SharedPreferences
+    private lateinit var zoneConfigRepository: ZoneConfigRepository
     private var multicastLock: WifiManager.MulticastLock? = null
     private var authDialogShown = false
     private var autoReconnectAttempted = false
@@ -377,13 +395,6 @@ class MainActivity : Activity() {
     private var lastResumeTime = 0L
     private var backgroundOperationsPaused = false
     private var connectionStateBeforePause: String? = null
-    
-    // Enhanced connection health monitoring variables
-    private var healthCheckInterval = 15000L // Reduced from 30s to 15s
-    private var healthCheckJob: Job? = null
-    private var connectionRetryCount = 0
-    private val maxRetryAttempts = 5
-    
     
     // Zone configuration
     private var currentZoneId: String? = null
@@ -495,6 +506,7 @@ class MainActivity : Activity() {
         logDebug("Screen adapter initialized - Type: ${screenAdapter.screenType}, Size: ${screenAdapter.screenWidth}x${screenAdapter.screenHeight}")
         
         sharedPreferences = getSharedPreferences("CoverArt", Context.MODE_PRIVATE)
+        zoneConfigRepository = ZoneConfigRepository(sharedPreferences)
         
         // Initialize message processor for sequential handling
         initializeMessageProcessor()
@@ -560,21 +572,15 @@ class MainActivity : Activity() {
                     if (lastSuccessfulCore != null) {
                         logDebug("📱 Boot startup: auto-connecting to ${lastSuccessfulCore.ip}:${lastSuccessfulCore.port}")
                         
-                        mainHandler.post {
-                            setHostInput("${lastSuccessfulCore.ip}:${lastSuccessfulCore.port}")
-                        }
-                        
-                        when (val result = smartConnectionManager.connectWithSmartRetry(
+                        when (smartConnectionManager.connectWithSmartRetry(
                             lastSuccessfulCore.ip,
                             lastSuccessfulCore.port
                         ) { status ->
                             mainHandler.post { updateStatus(status) }
                         }) {
                             is SmartConnectionManager.ConnectionResult.Success -> {
-                                mainHandler.post {
-                                    logDebug("📱 Boot startup: successfully connected!")
-                                    connect()
-                                }
+                                logDebug("📱 Boot startup: successfully connected!")
+                                startConnectionTo(lastSuccessfulCore.ip, lastSuccessfulCore.port)
                             }
                             else -> {
                                 mainHandler.post {
@@ -2185,119 +2191,10 @@ class MainActivity : Activity() {
         }
     }
     
-    private fun createBlurredBackground(originalBitmap: Bitmap, dominantColor: Int): android.graphics.drawable.Drawable {
-        try {
-            val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-            
-            if (isLandscape) {
-                // 横屏：创建径向渐变背景
-                return createRadialGradientBackground(dominantColor)
-            } else {
-                // 竖屏：保持原有的高斯模糊效果
-                return createPortraitBlurredBackground(originalBitmap, dominantColor)
-            }
-            
-        } catch (e: Exception) {
-            logError("Failed to create background: ${e.message}")
-            // fallback到简单渐变
-            return GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(dominantColor, (dominantColor and 0x00FFFFFF) or 0x80000000.toInt())
-            )
-        }
-    }
-    
-    private fun createRadialGradientBackground(avgColor: Int): android.graphics.drawable.Drawable {
-        // 降低亮度30%，保留饱和度
-        val adjustedColor = reduceLightness(avgColor, 0.3f)
-        val darkColor = 0xFF1a1a1a.toInt()
-        
-        // 检查亮度，如果过亮则切换到暗色主题
-        val brightness = getBrightness(avgColor)
-        val centerColor = if (brightness > 0.75f) {
-            // 亮色封面：使用更深的颜色作为中心
-            reduceLightness(avgColor, 0.5f)
-        } else {
-            adjustedColor
-        }
-        
-        // 创建径向渐变drawable
-        return object : android.graphics.drawable.Drawable() {
-            override fun draw(canvas: android.graphics.Canvas) {
-                val centerX = bounds.width() / 2f
-                val centerY = bounds.height() / 2f
-                val radius = maxOf(bounds.width(), bounds.height()) * 0.8f
-                
-                val paint = android.graphics.Paint().apply {
-                    shader = android.graphics.RadialGradient(
-                        centerX, centerY, radius,
-                        intArrayOf(centerColor, darkColor),
-                        floatArrayOf(0.0f, 1.0f),
-                        android.graphics.Shader.TileMode.CLAMP
-                    )
-                }
-                canvas.drawRect(bounds, paint)
-            }
-            
-            override fun setAlpha(alpha: Int) {}
-            override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
-            override fun getOpacity(): Int = android.graphics.PixelFormat.OPAQUE
-        }
-    }
-    
-    private fun createPortraitBlurredBackground(originalBitmap: Bitmap, dominantColor: Int): android.graphics.drawable.Drawable {
-        // 创建缩小的bitmap用于模糊处理
-        val scaledBitmap = Bitmap.createScaledBitmap(originalBitmap, 100, 100, true)
-        
-        // 简单的模糊效果（通过缩放和颜色混合实现）
-        val blurredBitmap = Bitmap.createBitmap(scaledBitmap.width, scaledBitmap.height, Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(blurredBitmap)
-        
-        // 绘制原图
-        canvas.drawBitmap(scaledBitmap, 0f, 0f, null)
-        
-        // 降低饱和度20%，与深灰过渡
-        val reducedSaturation = reduceSaturation(dominantColor, 0.2f)
-        val darkGray = 0xFF1a1a1a.toInt()
-        
-        // 创建渐变覆盖层
-        val overlayPaint = android.graphics.Paint().apply {
-            shader = android.graphics.LinearGradient(
-                0f, 0f, 
-                scaledBitmap.width.toFloat(), scaledBitmap.height.toFloat(),
-                intArrayOf(reducedSaturation, darkGray),
-                floatArrayOf(0.3f, 1.0f),
-                android.graphics.Shader.TileMode.CLAMP
-            )
-            alpha = 200 // 80% alpha
-        }
-        canvas.drawRect(0f, 0f, scaledBitmap.width.toFloat(), scaledBitmap.height.toFloat(), overlayPaint)
-        
-        // 创建BitmapDrawable，移除平铺模式避免边缘残影
-        val drawable = android.graphics.drawable.BitmapDrawable(resources, blurredBitmap)
-        drawable.gravity = android.view.Gravity.FILL
-        
-        return drawable
-    }
-    
-    private fun reduceLightness(color: Int, reduction: Float): Int {
-        val hsv = FloatArray(3)
-        android.graphics.Color.colorToHSV(color, hsv)
-        hsv[2] = (hsv[2] * (1 - reduction)).coerceIn(0f, 1f) // 降低亮度
-        return android.graphics.Color.HSVToColor(hsv)
-    }
-    
     private fun getBrightness(color: Int): Float {
         val hsv = FloatArray(3)
         android.graphics.Color.colorToHSV(color, hsv)
         return hsv[2] // 返回HSV中的V值（亮度）
-    }
-    
-    private fun reduceSaturation(color: Int, reduction: Float): Int {
-        val hsv = FloatArray(3)
-        android.graphics.Color.colorToHSV(color, hsv)
-        hsv[1] = (hsv[1] * (1 - reduction)).coerceIn(0f, 1f) // 降低饱和度
-        return android.graphics.Color.HSVToColor(hsv)
     }
     
     private fun setHostInput(value: String, persist: Boolean = true) {
@@ -2312,6 +2209,23 @@ class MainActivity : Activity() {
         return currentHostInput.trim()
     }
 
+    private fun startConnectionTo(
+        ip: String,
+        port: Int,
+        delayMs: Long = 0L,
+        statusMessage: String? = null
+    ) {
+        runOnMainThread {
+            setHostInput("$ip:$port")
+            statusMessage?.let { updateStatus(it) }
+            if (delayMs > 0) {
+                mainHandler.postDelayed({ connect() }, delayMs)
+            } else {
+                connect()
+            }
+        }
+    }
+
     private fun loadSavedIP() {
         val savedIP = sharedPreferences.getString("last_roon_ip", "")
         if (!savedIP.isNullOrEmpty()) {
@@ -2319,43 +2233,111 @@ class MainActivity : Activity() {
             logDebug("Loaded saved IP: $savedIP")
         }
     }
+
+    private fun parseHostPortInput(hostPort: String): Pair<String, Int> {
+        return if (hostPort.contains(":")) {
+            val parts = hostPort.split(":")
+            parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: ROON_WS_PORT)
+        } else {
+            hostPort to ROON_WS_PORT
+        }
+    }
+
+    private fun findHostPortByCoreId(coreId: String): String? {
+        var matchedHostPort: String? = null
+        var latestConnectionTime = Long.MIN_VALUE
+
+        for ((key, value) in sharedPreferences.all) {
+            if (!key.startsWith("roon_core_id_")) continue
+            if (value != coreId) continue
+
+            val hostPort = key.removePrefix("roon_core_id_")
+            val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0L)
+            if (lastConnected >= latestConnectionTime) {
+                latestConnectionTime = lastConnected
+                matchedHostPort = hostPort
+            }
+        }
+
+        return matchedHostPort
+    }
     
     private fun loadPairedCores() {
+        pairedCores.clear()
+
         // Load all saved tokens and create paired core info
         val allPrefs = sharedPreferences.all
-        for ((key, value) in allPrefs) {
-            if (key.startsWith("roon_core_token_") && value is String) {
-                val hostPort = key.removePrefix("roon_core_token_")
-                val (host, port) = if (hostPort.contains(":")) {
-                    val parts = hostPort.split(":")
-                    parts[0] to (parts.getOrNull(1)?.toIntOrNull() ?: ROON_WS_PORT)
-                } else {
-                    hostPort to ROON_WS_PORT
-                }
-            
-                // Validate host to prevent "by_core_id_" issues
-                if (!isValidHost(host)) {
-                    logDebug("⚠️ Skipping paired core with invalid host: $host")
-                    continue
-                }
-                
-                val coreId = sharedPreferences.getString("roon_core_id_$hostPort", "") ?: ""
-                val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0)
-                
-                pairedCores[hostPort] = PairedCoreInfo(
-                    ip = host,
-                    port = port,
-                    token = value,
-                    coreId = coreId,
-                    lastConnected = lastConnected
-                )
-                
-                logDebug("Loaded paired core: $hostPort (last connected: $lastConnected)")
+        fun upsertPairedCore(hostPort: String, token: String, coreId: String, lastConnected: Long) {
+            val (host, port) = parseHostPortInput(hostPort)
+
+            if (!isValidHost(host)) {
+                logDebug("⚠️ Skipping paired core with invalid host: $host")
+                return
             }
+
+            val existing = pairedCores[hostPort]
+            if (existing != null && existing.lastConnected > lastConnected) {
+                return
+            }
+
+            pairedCores[hostPort] = PairedCoreInfo(
+                ip = host,
+                port = port,
+                token = token,
+                coreId = coreId,
+                lastConnected = lastConnected
+            )
+
+            logDebug("Loaded paired core: $hostPort (last connected: $lastConnected, coreId: $coreId)")
+        }
+
+        // Legacy host-based token keys
+        for ((key, value) in allPrefs) {
+            if (!key.startsWith("roon_core_token_")) continue
+            if (key.startsWith("roon_core_token_by_core_id_")) continue
+            if (value !is String) continue
+
+            val hostPort = key.removePrefix("roon_core_token_")
+            val coreId = sharedPreferences.getString("roon_core_id_$hostPort", "") ?: ""
+            val lastConnected = sharedPreferences.getLong("roon_last_connected_$hostPort", 0L)
+            upsertPairedCore(hostPort, value, coreId, lastConnected)
+        }
+
+        // New core_id-based token keys
+        for ((key, value) in allPrefs) {
+            if (!key.startsWith("roon_core_token_by_core_id_")) continue
+            if (value !is String) continue
+
+            val coreId = key.removePrefix("roon_core_token_by_core_id_")
+            var hostPort = findHostPortByCoreId(coreId)
+            if (hostPort == null) {
+                val lastHost = sharedPreferences.getString("last_successful_host", null)
+                val lastPort = sharedPreferences.getInt("last_successful_port", 0)
+                if (!lastHost.isNullOrBlank() && lastPort > 0) {
+                    hostPort = "$lastHost:$lastPort"
+                }
+            }
+
+            if (hostPort == null) {
+                logDebug("⚠️ Core-id token found but no host mapping: $coreId")
+                continue
+            }
+
+            val lastConnected = sharedPreferences.getLong(
+                "roon_last_connected_by_core_id_$coreId",
+                sharedPreferences.getLong("last_connection_time", 0L)
+            )
+
+            upsertPairedCore(hostPort, value, coreId, lastConnected)
         }
     }
     
     private fun startAutomaticDiscoveryAndPairing() {
+        if (!discoveryGuard.tryStart()) {
+            logDebug("Discovery already in progress, skipping duplicate trigger")
+            return
+        }
+
         logDebug("Starting automatic discovery and pairing")
         
         // First try to reconnect to previously paired cores
@@ -2363,20 +2345,20 @@ class MainActivity : Activity() {
             val lastPairedCore = pairedCores.values.maxByOrNull { it.lastConnected }
             if (lastPairedCore != null) {
                 logDebug("Attempting auto-reconnection to ${lastPairedCore.ip}:${lastPairedCore.port}")
-                
-                setHostInput("${lastPairedCore.ip}:${lastPairedCore.port}")
-                statusText.text = "正在自动连接到上次配对的Roon Core..."
-                
-                mainHandler.postDelayed({
-                    connect()
-                }, 1000)
+                startConnectionTo(
+                    ip = lastPairedCore.ip,
+                    port = lastPairedCore.port,
+                    delayMs = 1000,
+                    statusMessage = "正在自动连接到上次配对的Roon Core..."
+                )
+                discoveryGuard.finish()
                 return
             }
         }
         
         // No paired cores found, start automatic discovery
         logDebug("No paired cores found, starting automatic discovery")
-        statusText.text = "正在自动发现Roon Core..."
+        updateStatus("正在自动发现Roon Core...")
         
         discoveredCores.clear()
         multicastLock?.acquire()
@@ -2405,15 +2387,13 @@ class MainActivity : Activity() {
                         // Automatically connect to the first discovered core
                         val firstCore = discoveredCores.values.first()
                         logDebug("Auto-connecting to discovered core: ${firstCore.ip}:${firstCore.port}")
-                        
-                        setHostInput("${firstCore.ip}:${firstCore.port}")
-                        statusText.text = "发现Roon Core，正在自动连接..."
-                        
-                        // Automatically connect without user dialog
-                        // Connect immediately when discovered
-                        connect()
+                        startConnectionTo(
+                            ip = firstCore.ip,
+                            port = firstCore.port,
+                            statusMessage = "发现Roon Core，正在自动连接..."
+                        )
                     } else {
-                        statusText.text = "未发现Roon Core，请检查网络连接"
+                        updateStatus("未发现Roon Core，请检查网络连接")
                         logWarning("No Roon Cores discovered, showing manual options")
                         
                         // 保持极简界面，不显示额外连接选项
@@ -2423,8 +2403,10 @@ class MainActivity : Activity() {
                 logError("Automatic discovery failed: ${e.message}", e)
                 mainHandler.post {
                     multicastLock?.release()
-                    statusText.text = "自动发现失败，请检查网络后重试"
+                    updateStatus("自动发现失败，请检查网络后重试")
                 }
+            } finally {
+                discoveryGuard.finish()
             }
         }
     }
@@ -2444,19 +2426,16 @@ class MainActivity : Activity() {
         val lastPairedCore = pairedCores.values.maxByOrNull { it.lastConnected }
         if (lastPairedCore != null) {
             logDebug("Attempting auto-reconnection to ${lastPairedCore.ip}:${lastPairedCore.port}")
-            
-            // Set the IP input and attempt connection
-            setHostInput("${lastPairedCore.ip}:${lastPairedCore.port}")
-            statusText.text = "正在自动连接到上次配对的Roon Core..."
-            
-            // Delay to allow UI to update
-            mainHandler.postDelayed({
-                connect()
-            }, 1000)
+            startConnectionTo(
+                ip = lastPairedCore.ip,
+                port = lastPairedCore.port,
+                delayMs = 1000,
+                statusMessage = "正在自动连接到上次配对的Roon Core..."
+            )
         } else {
             // No previously paired cores, try discovery
             logDebug("No paired cores found, starting auto-discovery")
-            statusText.text = "未找到已配对的Core，正在自动发现..."
+            updateStatus("未找到已配对的Core，正在自动发现...")
             mainHandler.postDelayed({
                 startAutomaticDiscoveryAndPairing()
             }, 2000)
@@ -2498,7 +2477,7 @@ class MainActivity : Activity() {
             // Not first time - try saved successful connections first
             logDebug("🔄 Trying ${savedConnections.size} saved connection(s)")
             mainHandler.post {
-                statusText.text = "尝试已保存的连接..."
+                updateStatus("尝试已保存的连接...")
             }
             
             for ((ip, port) in savedConnections) {
@@ -2517,7 +2496,7 @@ class MainActivity : Activity() {
                     saveSuccessfulConnection(ip, port)
                     
                     mainHandler.post {
-                        statusText.text = "✅ 重连成功: $ip:$port"
+                        updateStatus("✅ 重连成功: $ip:$port")
                     }
                     return // Found saved connection! Skip full scan
                 }
@@ -2525,12 +2504,12 @@ class MainActivity : Activity() {
             
             logDebug("⚠️ Saved connections failed, starting network scan")
             mainHandler.post {
-                statusText.text = "已保存连接失败，正在扫描网络..."
+                updateStatus("已保存连接失败，正在扫描网络...")
             }
         } else {
             logDebug("🆕 First time setup - starting full network discovery")
             mainHandler.post {
-                statusText.text = "首次使用，正在扫描网络寻找Roon Core..."
+                updateStatus("首次使用，正在扫描网络寻找Roon Core...")
             }
         }
         
@@ -2588,7 +2567,7 @@ class MainActivity : Activity() {
                             discoveredCores["$ip:ROON_WS_PORT"] = coreInfo
                             
                             mainHandler.post {
-                                statusText.text = "✅ 发现Roon Core: $ip:ROON_WS_PORT"
+                                updateStatus("✅ 发现Roon Core: $ip:ROON_WS_PORT")
                             }
                             break // Found standard port, stop searching this IP
                         } else if (port == 9332) {
@@ -2602,7 +2581,7 @@ class MainActivity : Activity() {
                             discoveredCores["$ip:9332"] = coreInfo
                             
                             mainHandler.post {
-                                statusText.text = "✅ 发现Roon Core: $ip:9332"
+                                updateStatus("✅ 发现Roon Core: $ip:9332")
                             }
                             break // Found alternative port, stop searching this IP
                         } else if (port == 9100) {
@@ -2616,7 +2595,7 @@ class MainActivity : Activity() {
                             discoveredCores["$ip:9100"] = coreInfo
                             
                             mainHandler.post {
-                                statusText.text = "✅ 发现Roon Core: $ip:9100"
+                                updateStatus("✅ 发现Roon Core: $ip:9100")
                             }
                             break // Found port, stop searching this IP
                         }
@@ -2818,7 +2797,7 @@ class MainActivity : Activity() {
                         saveSuccessfulConnection(sourceIP, testPort)
                         
                         withContext(Dispatchers.Main) {
-                            statusText.text = "✅ 发现Roon Core: $sourceIP:$testPort"
+                            updateStatus("✅ 发现Roon Core: $sourceIP:$testPort")
                         }
                         
                         logConnectionEvent("DISCOVERY", "INFO", "Core detected via $detectionMethod", 
@@ -3013,7 +2992,7 @@ class MainActivity : Activity() {
                             saveSuccessfulConnection(ip, port)
                             
                             withContext(Dispatchers.Main) {
-                                statusText.text = "✅ 发现Roon Core: $ip:$port"
+                                updateStatus("✅ 发现Roon Core: $ip:$port")
                             }
                             
                             logConnectionEvent("DISCOVERY", "INFO", "Core found via direct scan", 
@@ -3227,7 +3206,7 @@ class MainActivity : Activity() {
                     
                     logDebug("Valid Roon Core discovered: $name at $ip:$httpPort (ID: $uniqueId)")
                     mainHandler.post {
-                        statusText.text = "发现Roon Core: $name ($ip:$httpPort)"
+                        updateStatus("发现Roon Core: $name ($ip:$httpPort)")
                     }
                 } else {
                     logDebug("Not a Roon Core or missing required fields: serviceId=$serviceId, httpPort=$httpPort, uniqueId=$uniqueId")
@@ -3248,22 +3227,28 @@ class MainActivity : Activity() {
             updateStatus("未配置Roon Core地址，等待自动发现或重连")
             return
         }
+
+        if (!connectionGuard.tryStart()) {
+            logDebug("connect() skipped because another connection attempt is in progress")
+            updateStatus("连接进行中，请稍候...")
+            return
+        }
         
         updateStatus("正在验证连接...")
         
         activityScope.launch(Dispatchers.IO) {
-            // Prevent concurrent connection attempts
-            synchronized(this@MainActivity) {
-                if (webSocketClient?.isConnected() == true) {
-                    mainHandler.post {
-                        updateStatus("已连接")
-                    }
-                    return@launch
-                }
-            }
-            infoRequestSent.set(false)
-
             try {
+                // Prevent concurrent connection attempts
+                synchronized(this@MainActivity) {
+                    if (webSocketClient?.isConnected() == true) {
+                        mainHandler.post {
+                            updateStatus("已连接")
+                        }
+                        return@launch
+                    }
+                }
+                infoRequestSent.set(false)
+
                 // 使用简化的连接验证
                 val connectionInfo = connectionHelper.validateAndGetConnectionInfo(hostInput)
                 
@@ -3286,6 +3271,7 @@ class MainActivity : Activity() {
                 }
                 
                 // 确保断开旧连接，防止线程泄漏
+                healthMonitor.stopMonitoring()
                 webSocketClient?.disconnect()
                 
                 // 创建WebSocket连接
@@ -3313,19 +3299,24 @@ class MainActivity : Activity() {
                 logError("Connection failed: ${e.message}", e)
                 withContext(Dispatchers.Main) {
                     updateStatus("连接失败: ${e.message}")
+                    healthMonitor.stopMonitoring()
                     // Ensure client is cleaned up on failure
                     if (webSocketClient?.isConnected() != true) {
                         webSocketClient?.disconnect()
                         webSocketClient = null
                     }
                 }
+            } finally {
+                connectionGuard.finish()
             }
         }
     }
     
     private fun disconnect() {
+        healthMonitor.stopMonitoring()
         webSocketClient?.disconnect()
         webSocketClient = null
+        connectionGuard.finish()
         authDialogShown = false
         autoReconnectAttempted = false // Allow future auto-reconnection attempts
         updateStatus("未连接到Roon")
@@ -3492,6 +3483,7 @@ class MainActivity : Activity() {
                 // 启动连接健康监控
                 val currentConnection = webSocketClient
                 if (currentConnection != null) {
+                    healthMonitor.stopMonitoring()
                     healthMonitor.startMonitoring(currentConnection.getHost(), currentConnection.getPort()) { healthStatus ->
                         when (healthStatus) {
                             is ConnectionHealthMonitor.HealthStatus.Healthy -> {
@@ -3901,13 +3893,6 @@ class MainActivity : Activity() {
         sendMoo(mooMessage)
     }
     
-    private fun retryRegistrationWithoutSettings() {
-        logWarning("Retrying registration without settings service due to previous failure")
-        val request = prepareRegisterRequest(includeSettings = false)
-        logDebug("Retry register message (with token: ${request.hasToken}):\n${request.mooMessage}")
-        sendMoo(request.mooMessage)
-    }
-    
     private fun handleZoneUpdate(body: JSONObject) {
         try {
             // 支持多种数据格式：
@@ -3933,57 +3918,31 @@ class MainActivity : Activity() {
                 
                 // 2. 简化的Zone配置逻辑
                 val storedZoneId = loadStoredZoneConfiguration()
+                val selectionDecision = zoneSelectionUseCase.selectZone(
+                    availableZones = availableZones,
+                    storedZoneId = storedZoneId,
+                    currentZoneId = currentZoneId
+                )
+                val selectionReason = selectionDecision.reason
+                val selectedZoneId = selectionDecision.zoneId
                 var selectedZone: JSONObject? = null
-                var selectionReason = ""
-                
-                if (storedZoneId != null && availableZones.containsKey(storedZoneId)) {
-                    // 有存储配置且有效 → 使用存储配置
-                    selectedZone = availableZones[storedZoneId]
-                    selectionReason = "存储配置"
-                    applyZoneSelection(
-                        zoneId = storedZoneId,
-                        reason = selectionReason,
-                        persist = false,
-                        recordUsage = false,
-                        updateFiltering = false,
-                        showFeedback = false
-                    )
-                    logDebug("🎯 使用存储配置: ${selectedZone?.optString("display_name")} ($storedZoneId)")
-                    
-                } else if (storedZoneId != null && !availableZones.containsKey(storedZoneId)) {
-                    // 有存储配置但失效 → 保守策略：保留配置，显示状态
-                    selectionReason = "配置失效"
-                    applyZoneSelection(
-                        zoneId = storedZoneId,
-                        reason = selectionReason,
-                        persist = false,
-                        recordUsage = false,
-                        updateFiltering = false,
-                        showFeedback = false
-                    )
+
+                selectionDecision.statusMessage?.let { updateStatus(it) }
+                if (storedZoneId != null && selectedZoneId != storedZoneId && !availableZones.containsKey(storedZoneId)) {
                     logWarning("⚠️ 存储的Zone配置不可用: $storedZoneId")
-                    mainHandler.post {
-                        updateStatus("⚠️ 配置的Zone不可用: $storedZoneId")
-                    }
-                    
-                } else if (currentZoneId == null && availableZones.isNotEmpty()) {
-                    // 无存储配置 → 自动选择一次并存储
-                    selectedZone = performAutoZoneSelection()
-                    if (selectedZone != null) {
-                        val autoZoneId = selectedZone.optString("zone_id")
-                        if (autoZoneId.isNotEmpty()) {
-                            selectionReason = "自动选择"
-                            applyZoneSelection(
-                                zoneId = autoZoneId,
-                                reason = selectionReason,
-                                persist = true,
-                                recordUsage = false,
-                                updateFiltering = false,
-                                showFeedback = false
-                            )
-                            logDebug("🔄 自动选择并存储: ${selectedZone.optString("display_name")} ($autoZoneId)")
-                        }
-                    }
+                }
+
+                if (selectedZoneId != null && availableZones.containsKey(selectedZoneId)) {
+                    applyZoneSelection(
+                        zoneId = selectedZoneId,
+                        reason = selectionReason,
+                        persist = selectionDecision.persist,
+                        recordUsage = false,
+                        updateFiltering = false,
+                        showFeedback = false
+                    )
+                    selectedZone = availableZones[selectedZoneId]
+                    logDebug("🎯 Zone选择: ${selectedZone?.optString("display_name")} ($selectedZoneId, $selectionReason)")
                 }
                 
                 // 3. 更新UI和状态
@@ -4001,9 +3960,10 @@ class MainActivity : Activity() {
                             val artist = playbackInfo.artist ?: "未知艺术家"
                             val album = playbackInfo.album ?: "未知专辑"
 
-                            val currentTitle = trackText.text.toString()
-                            val currentArtist = artistText.text.toString()
-                            val currentAlbum = albumText.text.toString()
+                            val snapshotState = currentState.get()
+                            val currentTitle = snapshotState.trackText
+                            val currentArtist = snapshotState.artistText
+                            val currentAlbum = snapshotState.albumText
 
                             val trackChanged = title != currentTitle || artist != currentArtist || album != currentAlbum
 
@@ -4013,8 +3973,6 @@ class MainActivity : Activity() {
                             } else {
                                 logDebug("🎵 Track info unchanged - keeping current display")
                             }
-
-                            saveUIState()
 
                             logDebug("🎵 Current playback state: '$state', Art wall mode: $isArtWallMode")
 
@@ -4054,9 +4012,7 @@ class MainActivity : Activity() {
                             } else {
                                 logDebug("⚠️ No image_key in now_playing")
                                 sharedPreferences.edit().remove("current_image_key").apply()
-                                mainHandler.post {
-                                    albumArtView.setImageResource(android.R.color.darker_gray)
-                                }
+                                mainHandler.post { updateAlbumImage(null, null) }
                             }
                         } else {
                             logDebug("No music playing in selected zone")
@@ -4153,9 +4109,11 @@ class MainActivity : Activity() {
         // 在后台线程发送图片请求，避免NetworkOnMainThreadException
         GlobalScope.launch(Dispatchers.IO) {
             try {
-                sendMoo(mooMessage) ?: run {
+                if (webSocketClient == null) {
                     logError("❌ WebSocket client is null")
+                    return@launch
                 }
+                sendMoo(mooMessage)
             } catch (e: Exception) {
                 logError("❌ Failed to send image request: ${e.message}")
             }
@@ -4283,33 +4241,23 @@ class MainActivity : Activity() {
                         } else {
                             logWarning("Failed to decode image bitmap - data may be corrupted")
                             checkForImageHeaders(bytes)
-                            mainHandler.post {
-                                albumArtView.setImageResource(android.R.color.darker_gray)
-                            }
+                            mainHandler.post { updateAlbumImage(null, null) }
                         }
                     } catch (e: Exception) {
                         logError("Error decoding image: ${e.message}", e)
-                        mainHandler.post {
-                            albumArtView.setImageResource(android.R.color.darker_gray)
-                        }
+                        mainHandler.post { updateAlbumImage(null, null) }
                     }
                 } else {
                     logWarning("No image data found in response")
-                    mainHandler.post {
-                        albumArtView.setImageResource(android.R.color.darker_gray)
-                    }
+                    mainHandler.post { updateAlbumImage(null, null) }
                 }
             } ?: run {
                 logWarning("Invalid image response format")
-                mainHandler.post {
-                    albumArtView.setImageResource(android.R.color.darker_gray)
-                }
+                mainHandler.post { updateAlbumImage(null, null) }
             }
         } catch (e: Exception) {
             logError("Error processing image response: ${e.message}", e)
-            mainHandler.post {
-                albumArtView.setImageResource(android.R.color.darker_gray)
-            }
+            mainHandler.post { updateAlbumImage(null, null) }
         }
     }
     
@@ -4331,7 +4279,7 @@ class MainActivity : Activity() {
     private fun initializeRoonApiSettings() {
         roonApiSettings = RoonApiSettings(
             getHostInput = { getHostInput() },
-            sharedPreferences = sharedPreferences,
+            zoneConfigRepository = zoneConfigRepository,
             onZoneConfigChanged = { zoneId ->
                 handleZoneConfigurationChange(zoneId)
             },
@@ -4487,9 +4435,7 @@ class MainActivity : Activity() {
      * 保存Zone配置（按Core ID）
      */
     private fun saveZoneConfiguration(zoneId: String) {
-        sharedPreferences.edit()
-            .putString(ZONE_CONFIG_KEY, zoneId)
-            .apply()
+        zoneConfigRepository.saveZoneConfiguration(zoneId)
         logDebug("💾 保存Zone配置: $zoneId")
     }
     
@@ -4497,91 +4443,14 @@ class MainActivity : Activity() {
      * 加载存储的Zone配置（按Core ID）
      */
     private fun loadStoredZoneConfiguration(): String? {
-        val storedZoneId = sharedPreferences.getString(ZONE_CONFIG_KEY, null)
-        if (storedZoneId != null) {
-            logDebug("📂 加载Zone配置: $storedZoneId")
-            return storedZoneId
+        val zoneId = zoneConfigRepository.loadZoneConfiguration(
+            hostInput = getHostInput(),
+            findZoneIdByOutputId = ::findZoneIdByOutputId
+        )
+        if (zoneId != null) {
+            logDebug("📂 加载Zone配置: $zoneId")
         }
-
-        val legacyCoreId = getCurrentCoreId()
-        val legacyCoreKey = legacyCoreId?.let { "configured_zone_$it" }
-        val legacyZoneId = legacyCoreKey?.let { sharedPreferences.getString(it, null) }
-        if (legacyZoneId != null) {
-            sharedPreferences.edit()
-                .putString(ZONE_CONFIG_KEY, legacyZoneId)
-                .remove(legacyCoreKey)
-                .apply()
-            logDebug("📂 迁移Zone配置: $legacyZoneId")
-            return legacyZoneId
-        }
-
-        val hostInput = getHostInput()
-        val legacyOutputId = sharedPreferences.getString(OUTPUT_ID_KEY, null)
-            ?: if (hostInput.isNotEmpty()) {
-                sharedPreferences.getString("roon_zone_id_$hostInput", null)
-            } else {
-                null
-            }
-
-        if (legacyOutputId != null) {
-            val mappedZoneId = findZoneIdByOutputId(legacyOutputId)
-            if (mappedZoneId != null) {
-                sharedPreferences.edit()
-                    .putString(ZONE_CONFIG_KEY, mappedZoneId)
-                    .apply()
-                logDebug("📂 输出映射Zone配置: $mappedZoneId")
-                return mappedZoneId
-            }
-        }
-
-        return null
-    }
-    
-    /**
-     * 获取当前Roon Core ID
-     */
-    private fun getCurrentCoreId(): String? {
-        // 从连接的Core获取ID，优先使用Core的唯一标识
-        val hostInput = getHostInput()
-        if (hostInput.isEmpty()) return null
-        return sharedPreferences.getString("roon_core_id_$hostInput", null)
-    }
-    
-    /**
-     * 执行自动Zone选择（4级优先级）
-     */
-    private fun performAutoZoneSelection(): JSONObject? {
-        if (availableZones.isEmpty()) return null
-        
-        // 使用现有的4级优先级逻辑
-        for ((zoneId, zone) in availableZones) {
-            val state = zone.optString("state", "")
-            val nowPlaying = zone.optJSONObject("now_playing")
-            
-            // 1. 正在播放的Zone
-            if (state == "playing" && nowPlaying != null) {
-                logDebug("🎵 自动选择正在播放的Zone: ${zone.optString("display_name")}")
-                return zone
-            }
-        }
-        
-        for ((zoneId, zone) in availableZones) {
-            val nowPlaying = zone.optJSONObject("now_playing")
-            
-            // 2. 有音乐信息的Zone
-            if (nowPlaying != null) {
-                logDebug("📍 自动选择有音乐信息的Zone: ${zone.optString("display_name")}")
-                return zone
-            }
-        }
-        
-        // 3. 第一个Zone作为默认
-        val firstZone = availableZones.values.firstOrNull()
-        if (firstZone != null) {
-            logDebug("🔄 自动选择第一个Zone: ${firstZone.optString("display_name")}")
-        }
-        
-        return firstZone
+        return zoneId
     }
     
     private data class ZonePlaybackInfo(
@@ -4632,95 +4501,6 @@ class MainActivity : Activity() {
         }
     }
     
-    /**
-     * 获取Zone状态摘要
-     */
-    private fun getZoneStatusSummary(): String {
-        if (availableZones.isEmpty()) {
-            return "无可用区域"
-        }
-        
-        val total = availableZones.size
-        val playing = availableZones.values.count { it.optString("state") == "playing" }
-        val paused = availableZones.values.count { it.optString("state") == "paused" }
-        
-        return "共${total}个区域 (播放:$playing, 暂停:$paused)"
-    }
-    
-    /**
-     * 显示Zone详细信息
-     */
-    private fun showZoneDetailedInfo(zoneId: String) {
-        val zone = availableZones[zoneId] ?: return
-        val zoneName = zone.optString("display_name", "Unknown Zone")
-        val state = zone.optString("state", "stopped")
-        val outputs = getZoneOutputs(zoneId)
-
-        val info = buildString {
-            append("🎵 区域: $zoneName\n")
-            append("📊 状态: $state\n")
-            append("🔊 输出设备: ${outputs.size}个\n")
-
-            if (outputs.isNotEmpty()) {
-                append("\n设备列表:\n")
-                outputs.forEachIndexed { index, output ->
-                    val outputName = output.optString("display_name", "Unknown Output")
-                    append("${index + 1}. $outputName\n")
-                }
-            }
-
-            val playbackInfo = parseZonePlayback(zone)
-            if (playbackInfo != null) {
-                append("\n🎵 正在播放:\n")
-                append("标题: ${playbackInfo.title ?: ""}\n")
-                append("艺术家: ${playbackInfo.artist ?: ""}\n")
-                append("专辑: ${playbackInfo.album ?: ""}")
-            }
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("区域信息")
-            .setMessage(info)
-            .setPositiveButton("确定", null)
-            .show()
-    }
-    
-
-    /**
-     * 显示增强的状态信息
-     */
-    private fun showEnhancedStatusInfo() {
-        val info = buildString {
-            append("📱 CoverArt 状态信息\n\n")
-            append("🌐 连接状态: ${if (webSocketClient != null) "已连接" else "未连接"}\n")
-            append("🎵 ${getZoneStatusSummary()}\n")
-            
-            currentZoneId?.let { zoneId ->
-                val zoneName = getZoneName(zoneId)
-                append("🎯 当前区域: $zoneName\n")
-                
-                val zone = availableZones[zoneId]
-                zone?.let {
-                    val state = it.optString("state", "stopped")
-                    append("📊 播放状态: $state\n")
-                }
-            }
-            
-            // 显示设置信息
-            val autoSwitch = sharedPreferences.getBoolean("auto_switch_zones", true)
-            val showZoneInfo = sharedPreferences.getBoolean("show_zone_info", true)
-            append("\n⚙️ 设置:\n")
-            append("自动切换: ${if (autoSwitch) "开启" else "关闭"}\n")
-            append("显示区域信息: ${if (showZoneInfo) "开启" else "关闭"}")
-        }
-        
-        AlertDialog.Builder(this)
-            .setTitle("状态信息")
-            .setMessage(info)
-            .setPositiveButton("确定", null)
-            .show()
-    }
-    
     private fun loadZoneConfiguration() {
         currentZoneId = roonApiSettings.loadZoneConfiguration()
         logDebug("Loaded zone configuration: zoneId=$currentZoneId")
@@ -4738,183 +4518,6 @@ class MainActivity : Activity() {
         }
     }
     
-    // ============ Enhanced Error Handling ============
-    
-    /**
-     * 验证Zone选择的有效性
-     */
-    private fun validateZoneSelection(zoneId: String?): Boolean {
-        if (zoneId == null) {
-            logWarning("Zone ID is null")
-            return false
-        }
-        
-        if (availableZones.isEmpty()) {
-            logWarning("No available zones")
-            mainHandler.post {
-                updateStatus("⚠️ 暂无可用区域")
-            }
-            return false
-        }
-        
-        if (!availableZones.containsKey(zoneId)) {
-            logWarning("Selected zone not found: $zoneId")
-            mainHandler.post {
-                updateStatus("⚠️ 选择的区域不存在，使用自动选择")
-            }
-            return false
-        }
-        
-        return true
-    }
-    
-    /**
-     * 处理Zone选择错误
-     */
-    private fun handleZoneSelectionError(error: String, zoneId: String?) {
-        logError("Zone selection error: $error for zone: $zoneId")
-        
-        mainHandler.post {
-            updateStatus("❌ Zone选择失败: $error")
-            
-            // 回退到自动选择
-            if (availableZones.isNotEmpty()) {
-                val firstZone = availableZones.entries.first()
-                val fallbackZoneName = firstZone.value.optString("display_name", "Unknown")
-                updateStatus("🔄 回退到自动选择: $fallbackZoneName")
-                
-                // 显示Toast提示用户
-                Toast.makeText(this@MainActivity, 
-                    "Zone选择失败，已自动切换到: $fallbackZoneName", 
-                    Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-    
-    /**
-     * 处理连接相关的Zone错误
-     */
-    private fun handleZoneConnectionError(zoneId: String, error: String) {
-        logError("Zone connection error for $zoneId: $error")
-        
-        val zoneName = getZoneName(zoneId)
-        
-        mainHandler.post {
-            updateStatus("❌ 区域连接失败: $zoneName")
-            
-            // 提供重试选项
-            AlertDialog.Builder(this@MainActivity)
-                .setTitle("区域连接失败")
-                .setMessage("无法连接到区域 '$zoneName'。\n\n错误: $error\n\n是否要重试或选择其他区域？")
-                .setPositiveButton("重试") { _, _ ->
-                    // 重新尝试连接该Zone
-                    retryZoneConnection(zoneId)
-                }
-                .setNeutralButton("选择其他区域") { _, _ ->
-                    // 显示Zone选择列表
-                    showZoneSelectionDialog()
-                }
-                .setNegativeButton("取消", null)
-                .show()
-        }
-    }
-    
-    /**
-     * 重试Zone连接
-     */
-    private fun retryZoneConnection(zoneId: String) {
-        if (validateZoneSelection(zoneId)) {
-            logDebug("Retrying connection to zone: $zoneId")
-            currentZoneId = zoneId
-            
-            mainHandler.post {
-                updateStatus("🔄 正在重试连接区域: ${getZoneName(zoneId)}")
-            }
-            
-            // 重新触发Zone选择逻辑
-            updateZoneFiltering()
-        } else {
-            handleZoneSelectionError("Zone validation failed during retry", zoneId)
-        }
-    }
-    
-    /**
-     * 显示Zone选择对话框
-     */
-    private fun showZoneSelectionDialog() {
-        if (availableZones.isEmpty()) {
-            Toast.makeText(this, "暂无可用区域", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        val zoneList = availableZones.entries.toList()
-        val zoneNames = zoneList.map { (_, zone) ->
-            val name = zone.optString("display_name", "Unknown Zone")
-            val state = zone.optString("state", "stopped")
-            val stateIcon = when (state) {
-                "playing" -> "▶️"
-                "paused" -> "⏸️"
-                else -> "⏹️"
-            }
-            "$stateIcon $name"
-        }.toTypedArray()
-        
-        AlertDialog.Builder(this)
-            .setTitle("选择播放区域")
-            .setItems(zoneNames) { _, which ->
-                val selectedZone = zoneList[which]
-                val selectedZoneId = selectedZone.key
-                val zoneName = selectedZone.value.optString("display_name", "Unknown Zone")
-                
-                logDebug("User selected zone: $selectedZoneId ($zoneName)")
-                
-                // 手动设置Zone
-                applyZoneSelection(
-                    zoneId = selectedZoneId,
-                    reason = "手动选择",
-                    persist = false,
-                    recordUsage = false,
-                    updateFiltering = true,
-                    showFeedback = true,
-                    statusMessage = "✅ 手动选择区域: $zoneName"
-                )
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-    
-    /**
-     * 处理Settings API错误
-     */
-    private fun handleSettingsApiError(error: String) {
-        logError("Settings API error: $error")
-        
-        mainHandler.post {
-            updateStatus("⚠️ 设置服务错误: $error")
-            
-            Toast.makeText(this@MainActivity, 
-                "无法访问Roon设置服务，将使用默认Zone选择", 
-                Toast.LENGTH_LONG).show()
-        }
-    }
-    
-    /**
-     * 处理Zone数据无效错误
-     */
-    private fun handleInvalidZoneData(zoneData: Any?) {
-        logError("Invalid zone data received: ${zoneData?.toString()?.take(100)}")
-        
-        mainHandler.post {
-            updateStatus("⚠️ 接收到无效的区域数据")
-            
-            if (availableZones.isNotEmpty()) {
-                updateStatus("🔄 使用已缓存的区域信息")
-            } else {
-                updateStatus("❌ 无法获取区域信息，请重新连接")
-            }
-        }
-    }
-    
     private fun getZoneName(zoneId: String): String {
         return availableZones[zoneId]?.optString("display_name", "Zone $zoneId") ?: "Unknown Zone"
     }
@@ -4926,353 +4529,13 @@ class MainActivity : Activity() {
      * 支持Roon API中的Output到Zone映射
      */
     private fun findZoneIdByOutputId(outputId: String): String? {
-        for ((zoneId, zone) in availableZones) {
-            val outputs = zone.optJSONArray("outputs")
-            if (outputs != null) {
-                for (i in 0 until outputs.length()) {
-                    val output = outputs.getJSONObject(i)
-                    if (output.optString("output_id") == outputId) {
-                        logDebug("Found zone $zoneId for output $outputId")
-                        return zoneId
-                    }
-                }
-            }
+        val zoneId = zoneConfigRepository.findZoneIdByOutputId(outputId, availableZones)
+        if (zoneId != null) {
+            logDebug("Found zone $zoneId for output $outputId")
+            return zoneId
         }
         logWarning("No zone found for output: $outputId")
         return null
-    }
-    
-    /**
-     * 获取Zone的所有Output设备
-     */
-    private fun getZoneOutputs(zoneId: String): List<JSONObject> {
-        val outputs = mutableListOf<JSONObject>()
-        val zone = availableZones[zoneId]
-        val outputsArray = zone?.optJSONArray("outputs")
-        
-        if (outputsArray != null) {
-            for (i in 0 until outputsArray.length()) {
-                outputs.add(outputsArray.getJSONObject(i))
-            }
-        }
-        
-        return outputs
-    }
-    
-    /**
-     * 检查Output是否在指定Zone中
-     */
-    private fun isOutputInZone(outputId: String, zoneId: String): Boolean {
-        val zone = availableZones[zoneId]
-        val outputs = zone?.optJSONArray("outputs")
-        
-        if (outputs != null) {
-            for (i in 0 until outputs.length()) {
-                val output = outputs.getJSONObject(i)
-                if (output.optString("output_id") == outputId) {
-                    return true
-                }
-            }
-        }
-        
-        return false
-    }
-    
-    // ============ Multi-Zone Monitoring ============
-    
-    /**
-     * 启用多Zone监控功能
-     */
-    private fun enableMultiZoneMonitoring() {
-        isMultiZoneMonitoringEnabled = true
-        
-        // 从设置中加载监控的Zone列表
-        val savedZones = sharedPreferences.getStringSet("monitored_zones", emptySet()) ?: emptySet()
-        monitoredZones.clear()
-        monitoredZones.addAll(savedZones)
-        
-        logDebug("Multi-zone monitoring enabled for: ${monitoredZones.joinToString(", ")}")
-        
-        if (monitoredZones.isNotEmpty()) {
-            mainHandler.post {
-                updateStatus("🎵 多区域监控: ${monitoredZones.size}个区域")
-            }
-        }
-    }
-    
-    /**
-     * 禁用多Zone监控功能
-     */
-    private fun disableMultiZoneMonitoring() {
-        isMultiZoneMonitoringEnabled = false
-        monitoredZones.clear()
-        
-        logDebug("Multi-zone monitoring disabled")
-        
-        mainHandler.post {
-            updateStatus("🎵 单区域模式")
-        }
-    }
-    
-    /**
-     * 添加Zone到监控列表
-     */
-    private fun addZoneToMonitoring(zoneId: String) {
-        if (availableZones.containsKey(zoneId)) {
-            monitoredZones.add(zoneId)
-            saveMonitoredZones()
-            
-            val zoneName = getZoneName(zoneId)
-            logDebug("Added zone to monitoring: $zoneName")
-            
-            mainHandler.post {
-                Toast.makeText(this@MainActivity, 
-                    "已添加监控区域: $zoneName", 
-                    Toast.LENGTH_SHORT).show()
-                updateMultiZoneDisplay()
-            }
-        } else {
-            logWarning("Cannot monitor zone $zoneId: not available")
-        }
-    }
-    
-    /**
-     * 从监控列表中移除Zone
-     */
-    private fun removeZoneFromMonitoring(zoneId: String) {
-        if (monitoredZones.remove(zoneId)) {
-            saveMonitoredZones()
-            
-            val zoneName = getZoneName(zoneId)
-            logDebug("Removed zone from monitoring: $zoneName")
-            
-            mainHandler.post {
-                Toast.makeText(this@MainActivity, 
-                    "已移除监控区域: $zoneName", 
-                    Toast.LENGTH_SHORT).show()
-                updateMultiZoneDisplay()
-            }
-        }
-    }
-    
-    /**
-     * 保存监控的Zone列表
-     */
-    private fun saveMonitoredZones() {
-        sharedPreferences.edit()
-            .putStringSet("monitored_zones", monitoredZones)
-            .apply()
-    }
-    
-    /**
-     * 更新多Zone显示
-     */
-    private fun updateMultiZoneDisplay() {
-        if (!isMultiZoneMonitoringEnabled || monitoredZones.isEmpty()) {
-            return
-        }
-        
-        val playingZones = availableZones.filter { (zoneId, zone) ->
-            monitoredZones.contains(zoneId) && zone.optString("state") == "playing"
-        }
-        
-        val pausedZones = availableZones.filter { (zoneId, zone) ->
-            monitoredZones.contains(zoneId) && zone.optString("state") == "paused"
-        }
-        
-        when {
-            playingZones.size > 1 -> {
-                // 多个区域正在播放
-                val zoneNames = playingZones.map { (_, zone) ->
-                    zone.optString("display_name", "Unknown")
-                }.joinToString(", ")
-                
-                mainHandler.post {
-                    updateStatus("🎵 多区域播放: $zoneNames")
-                }
-                
-                // 显示第一个播放的Zone的内容
-                val firstPlayingZone = playingZones.entries.first()
-                displayZoneContent(firstPlayingZone.key, firstPlayingZone.value)
-            }
-            playingZones.size == 1 -> {
-                // 单个区域播放
-                val playingZone = playingZones.entries.first()
-                val zoneName = playingZone.value.optString("display_name", "Unknown")
-                
-                mainHandler.post {
-                    updateStatus("🎵 播放: $zoneName")
-                }
-                
-                displayZoneContent(playingZone.key, playingZone.value)
-            }
-            pausedZones.isNotEmpty() -> {
-                // 有暂停的区域
-                val pausedZoneNames = pausedZones.map { (_, zone) ->
-                    zone.optString("display_name", "Unknown")
-                }.joinToString(", ")
-                
-                mainHandler.post {
-                    updateStatus("⏸️ 暂停: $pausedZoneNames")
-                }
-                
-                // 显示第一个暂停的Zone的内容
-                val firstPausedZone = pausedZones.entries.first()
-                displayZoneContent(firstPausedZone.key, firstPausedZone.value)
-            }
-            else -> {
-                // 所有监控的区域都停止了
-                mainHandler.post {
-                    updateStatus("⏹️ 监控的区域均已停止")
-                    enterArtWallMode()
-                }
-            }
-        }
-    }
-    
-    /**
-     * 显示指定Zone的内容
-     */
-    private fun displayZoneContent(zoneId: String, zone: JSONObject) {
-        val playbackInfo = parseZonePlayback(zone)
-
-        if (playbackInfo != null) {
-            val title = playbackInfo.title ?: "未知标题"
-            val artist = playbackInfo.artist ?: "未知艺术家"
-            val album = playbackInfo.album ?: "未知专辑"
-
-            mainHandler.post {
-                trackText.text = title
-                artistText.text = artist
-                albumText.text = album
-            }
-
-            val imageKey = playbackInfo.imageKey
-            if (imageKey != null) {
-                loadAlbumArt(imageKey)
-            }
-
-            logDebug("Displaying content from zone: ${getZoneName(zoneId)}")
-        } else {
-            logDebug("No content to display from zone: ${getZoneName(zoneId)}")
-        }
-    }
-    
-
-    /**
-     * 显示多Zone管理界面
-     */
-    private fun showMultiZoneManagementDialog() {
-        if (availableZones.isEmpty()) {
-            Toast.makeText(this, "暂无可用区域", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        val zoneList = availableZones.entries.toList()
-        val zoneItems = zoneList.map { (zoneId, zone) ->
-            val name = zone.optString("display_name", "Unknown Zone")
-            val state = zone.optString("state", "stopped")
-            val stateIcon = when (state) {
-                "playing" -> "▶️"
-                "paused" -> "⏸️"
-                else -> "⏹️"
-            }
-            val isMonitored = monitoredZones.contains(zoneId)
-            val monitorIcon = if (isMonitored) "✅" else "⚪"
-            
-            "$monitorIcon $stateIcon $name"
-        }.toTypedArray()
-        
-        val checkedItems = BooleanArray(zoneList.size) { index ->
-            monitoredZones.contains(zoneList[index].key)
-        }
-        
-        AlertDialog.Builder(this)
-            .setTitle("多区域监控管理")
-            .setMultiChoiceItems(zoneItems, checkedItems) { _, which, isChecked ->
-                val zoneId = zoneList[which].key
-                if (isChecked) {
-                    addZoneToMonitoring(zoneId)
-                } else {
-                    removeZoneFromMonitoring(zoneId)
-                }
-                checkedItems[which] = isChecked
-            }
-            .setPositiveButton("启用多区域监控") { _, _ ->
-                if (monitoredZones.isNotEmpty()) {
-                    enableMultiZoneMonitoring()
-                } else {
-                    Toast.makeText(this, "请至少选择一个区域", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNeutralButton("禁用多区域监控") { _, _ ->
-                disableMultiZoneMonitoring()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-    
-    // ============ Smart Zone Recommendation ============
-    
-    /**
-     * 获取推荐的Zone
-     * 基于历史使用模式和当前状态进行推荐
-     */
-    private fun getRecommendedZone(): String? {
-        if (availableZones.isEmpty()) {
-            return null
-        }
-        
-        // 1. 优先推荐正在播放的Zone
-        val playingZones = availableZones.filter { (_, zone) ->
-            zone.optString("state") == "playing"
-        }
-        
-        if (playingZones.isNotEmpty()) {
-            // 在播放的Zone中选择使用频率最高的
-            val mostUsedPlayingZone = playingZones.keys.maxByOrNull { zoneId ->
-                getZoneUsageCount(zoneId)
-            }
-            if (mostUsedPlayingZone != null) {
-                logDebug("Recommended playing zone: ${getZoneName(mostUsedPlayingZone)}")
-                return mostUsedPlayingZone
-            }
-        }
-        
-        // 2. 推荐使用频率最高的Zone
-        val mostUsedZone = availableZones.keys.maxByOrNull { zoneId ->
-            getZoneUsageCount(zoneId)
-        }
-        
-        if (mostUsedZone != null && getZoneUsageCount(mostUsedZone) > 0) {
-            logDebug("Recommended most used zone: ${getZoneName(mostUsedZone)}")
-            return mostUsedZone
-        }
-        
-        // 3. 推荐最近使用的Zone
-        val recentZone = getRecentlyUsedZone()
-        if (recentZone != null) {
-            logDebug("Recommended recent zone: ${getZoneName(recentZone)}")
-            return recentZone
-        }
-        
-        // 4. 推荐有音乐信息的Zone
-        val zoneWithMusic = availableZones.entries.find { (_, zone) ->
-            zone.optJSONObject("now_playing") != null
-        }?.key
-        
-        if (zoneWithMusic != null) {
-            logDebug("Recommended zone with music: ${getZoneName(zoneWithMusic)}")
-            return zoneWithMusic
-        }
-        
-        // 5. 默认推荐第一个Zone
-        val firstZone = availableZones.keys.firstOrNull()
-        if (firstZone != null) {
-            logDebug("Recommended first zone: ${getZoneName(firstZone)}")
-        }
-        
-        return firstZone
     }
     
     /**
@@ -5293,174 +4556,6 @@ class MainActivity : Activity() {
             .apply()
         
         logDebug("Recorded usage for zone ${getZoneName(zoneId)}: ${currentUsage + 1} times")
-    }
-    
-    /**
-     * 获取最近使用的Zone
-     */
-    private fun getRecentlyUsedZone(): String? {
-        var mostRecentZone: String? = null
-        var mostRecentTime = 0L
-        
-        for (zoneId in availableZones.keys) {
-            val lastUsed = sharedPreferences.getLong("zone_last_used_$zoneId", 0)
-            if (lastUsed > mostRecentTime) {
-                mostRecentTime = lastUsed
-                mostRecentZone = zoneId
-            }
-        }
-        
-        return mostRecentZone
-    }
-    
-    /**
-     * 获取Zone推荐理由
-     */
-    private fun getZoneRecommendationReason(zoneId: String): String {
-        val zone = availableZones[zoneId] ?: return "可用区域"
-        val state = zone.optString("state", "stopped")
-        val usageCount = getZoneUsageCount(zoneId)
-        val hasMusic = zone.optJSONObject("now_playing") != null
-        
-        return when {
-            state == "playing" && usageCount > 0 -> "正在播放 (常用)"
-            state == "playing" -> "正在播放"
-            usageCount > 10 -> "经常使用 (${usageCount}次)"
-            usageCount > 0 -> "最近使用"
-            hasMusic -> "有音乐信息"
-            else -> "可用区域"
-        }
-    }
-    
-    /**
-     * 显示Zone推荐对话框
-     */
-    private fun showZoneRecommendationDialog() {
-        val recommendedZone = getRecommendedZone()
-        
-        if (recommendedZone == null) {
-            Toast.makeText(this, "暂无可推荐的区域", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        val zoneName = getZoneName(recommendedZone)
-        val reason = getZoneRecommendationReason(recommendedZone)
-        
-        // 显示推荐的前3个Zone
-        val topZones = getTopRecommendedZones(3)
-        val recommendationText = buildString {
-            append("智能推荐区域：\n\n")
-            topZones.forEachIndexed { index, (zoneId, score) ->
-                val name = getZoneName(zoneId)
-                val zoneReason = getZoneRecommendationReason(zoneId)
-                val icon = when (index) {
-                    0 -> "🥇"
-                    1 -> "🥈"
-                    2 -> "🥉"
-                    else -> "${index + 1}."
-                }
-                append("$icon $name\n")
-                append("   理由: $zoneReason\n")
-                if (index < topZones.size - 1) append("\n")
-            }
-        }
-        
-        AlertDialog.Builder(this)
-            .setTitle("智能Zone推荐")
-            .setMessage(recommendationText)
-            .setPositiveButton("使用推荐") { _, _ ->
-                // 使用推荐的Zone
-                applyZoneSelection(
-                    zoneId = recommendedZone,
-                    reason = reason,
-                    persist = false,
-                    recordUsage = true,
-                    updateFiltering = true,
-                    showFeedback = true,
-                    statusMessage = "✅ 使用推荐区域: $zoneName"
-                )
-            }
-            .setNeutralButton("查看所有区域") { _, _ ->
-                showZoneSelectionDialog()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-    
-    /**
-     * 获取排名前N的推荐Zone
-     */
-    private fun getTopRecommendedZones(count: Int): List<Pair<String, Int>> {
-        return availableZones.keys.map { zoneId ->
-            val score = calculateZoneScore(zoneId)
-            zoneId to score
-        }.sortedByDescending { it.second }.take(count)
-    }
-    
-    /**
-     * 计算Zone的推荐分数
-     */
-    private fun calculateZoneScore(zoneId: String): Int {
-        val zone = availableZones[zoneId] ?: return 0
-        var score = 0
-        
-        // 播放状态得分
-        when (zone.optString("state", "stopped")) {
-            "playing" -> score += 100
-            "paused" -> score += 50
-        }
-        
-        // 使用频率得分
-        val usageCount = getZoneUsageCount(zoneId)
-        score += minOf(usageCount * 5, 50) // 最多50分
-        
-        // 最近使用得分
-        val lastUsed = sharedPreferences.getLong("zone_last_used_$zoneId", 0)
-        val daysSinceLastUsed = (System.currentTimeMillis() - lastUsed) / (24 * 60 * 60 * 1000)
-        score += when {
-            daysSinceLastUsed <= 1 -> 30
-            daysSinceLastUsed <= 7 -> 20
-            daysSinceLastUsed <= 30 -> 10
-            else -> 0
-        }
-        
-        // 有音乐信息得分
-        if (zone.optJSONObject("now_playing") != null) {
-            score += 20
-        }
-        
-        // 当前配置的Zone得分
-        if (zoneId == currentZoneId) {
-            score += 15
-        }
-        
-        return score
-    }
-    
-    /**
-     * 自动应用智能推荐
-     */
-    private fun applySmartRecommendation() {
-        // 只在没有手动配置Zone时才应用推荐
-        if (currentZoneId == null) {
-            val recommendedZone = getRecommendedZone()
-            if (recommendedZone != null) {
-                val zoneName = getZoneName(recommendedZone)
-                val reason = getZoneRecommendationReason(recommendedZone)
-                
-                logDebug("Applied smart recommendation: $zoneName ($reason)")
-                
-                applyZoneSelection(
-                    zoneId = recommendedZone,
-                    reason = reason,
-                    persist = false,
-                    recordUsage = false,
-                    updateFiltering = false,
-                    showFeedback = false,
-                    statusMessage = "🤖 智能推荐: $zoneName"
-                )
-            }
-        }
     }
     
     // ============ Connection History Management ============
@@ -5551,8 +4646,7 @@ class MainActivity : Activity() {
                         
                         // Connect using the working connection
                         withContext(Dispatchers.Main) {
-                            setHostInput("${connection.ip}:${connection.port}")
-                            connect()
+                            startConnectionTo(connection.ip, connection.port)
                         }
                         return
                     }
@@ -5575,7 +4669,7 @@ class MainActivity : Activity() {
         
         logWarning("Smart reconnect failed after $maxRetries attempts")
         withContext(Dispatchers.Main) {
-            statusText.text = "❌ 智能重连失败，请稍后重试"
+            updateStatus("❌ 智能重连失败，请稍后重试")
         }
     }
     
@@ -5637,11 +4731,18 @@ class MainActivity : Activity() {
     }
     
     private fun updateStatus(status: String) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { updateStatus(status) }
+            return
+        }
+
         stateLock.withLock {
             val newState = currentState.get().copy(statusText = status)
             currentState.set(newState)
             
-            statusText.text = status
+            if (::statusText.isInitialized) {
+                statusText.text = status
+            }
         }
     }
     
@@ -5682,7 +4783,7 @@ class MainActivity : Activity() {
             if (lastConnection != null && discoveredCores.isEmpty()) {
                 logConnectionEvent("AUTO_RECONNECT", "INFO", "Attempting auto-reconnect to ${lastConnection.ip}:${lastConnection.port}")
                 
-                when (val result = smartConnectionManager.connectWithSmartRetry(
+                when (smartConnectionManager.connectWithSmartRetry(
                     lastConnection.ip,
                     lastConnection.port
                 ) { status ->
@@ -5692,8 +4793,7 @@ class MainActivity : Activity() {
                 }) {
                     is SmartConnectionManager.ConnectionResult.Success -> {
                         withContext(Dispatchers.Main) {
-                            setHostInput("${lastConnection.ip}:${lastConnection.port}")
-                            connect()
+                            startConnectionTo(lastConnection.ip, lastConnection.port)
                         }
                         logConnectionEvent("AUTO_RECONNECT", "INFO", "Auto-reconnect successful")
                     }
@@ -5709,96 +4809,6 @@ class MainActivity : Activity() {
     private fun getLastSuccessfulConnection(): RoonCoreInfo? {
         val connections = getPrioritizedConnections()
         return connections.firstOrNull()
-    }
-    
-    // Enhanced Connection health monitoring
-    private fun startEnhancedConnectionHealthCheck() {
-        // Cancel any existing health check
-        healthCheckJob?.cancel()
-        
-        healthCheckJob = CoroutineScope(Dispatchers.IO).launch {
-            while (!isFinishing) {
-                try {
-                    delay(healthCheckInterval) // Enhanced: Reduced to 15 seconds
-                    
-                    if (isAppInBackground) {
-                        // Reduce check frequency when in background
-                        delay(healthCheckInterval) // Double the interval in background
-                    }
-                    
-                    // 由于我们现在使用了新的健康监控系统，这里可以移除原来的健康检查
-                    // performEnhancedHealthCheck()
-                    
-                } catch (e: Exception) {
-                    logError("Health check error: ${e.message}", e)
-                    delay(2000) // Short delay before retry on error
-                }
-            }
-        }
-    }
-    
-    private fun performEnhancedHealthCheck() {
-        val isConnected = webSocketClient?.isConnected() == true
-        val currentTime = System.currentTimeMillis()
-        
-        if (isConnected) {
-            // Connection is healthy
-            connectionRetryCount = 0 // Reset retry count on successful check
-            
-            // Update last seen time
-            val currentConnection = getCurrentConnection()
-            if (currentConnection != null) {
-                saveSuccessfulConnection(currentConnection.first, currentConnection.second)
-            }
-            
-            logDebug("✅ Health check passed - Connection healthy")
-            
-        } else {
-            // Connection lost - implement graded retry strategy
-            logWarning("❌ Health check failed - Connection lost")
-            logConnectionEvent("HEALTH_CHECK", "WARN", "Connection lost, retry count: $connectionRetryCount")
-            
-            when {
-                connectionRetryCount < 2 -> {
-                    // Quick retry for temporary network issues
-                    logDebug("🔄 Quick reconnection attempt ${connectionRetryCount + 1}")
-                    connectionRetryCount++
-                    GlobalScope.launch(Dispatchers.IO) { smartReconnect() }
-                }
-                connectionRetryCount < maxRetryAttempts -> {
-                    // Longer delay for persistent issues
-                    logDebug("⏳ Delayed reconnection attempt ${connectionRetryCount + 1}")
-                    connectionRetryCount++
-                    GlobalScope.launch(Dispatchers.IO) {
-                        delay(10000) // 10 second delay
-                        smartReconnect()
-                    }
-                }
-                else -> {
-                    // Max retries reached, stop health check and wait for manual intervention or network change
-                    logWarning("🚫 Max retry attempts reached, waiting for network change or manual reconnection")
-                    // Don't break the loop, just wait longer
-                    GlobalScope.launch(Dispatchers.IO) {
-                        delay(60000) // Wait 1 minute before trying again
-                        connectionRetryCount = 0 // Reset count for next cycle
-                    }
-                }
-            }
-        }
-    }
-    
-    private fun getCurrentConnection(): Pair<String, Int>? {
-        val input = getHostInput()
-        if (input.isEmpty()) return null
-        
-        return if (input.contains(":")) {
-            val parts = input.split(":")
-            if (parts.size == 2) {
-                parts[0] to (parts[1].toIntOrNull() ?: ROON_WS_PORT)
-            } else null
-        } else {
-            input to ROON_WS_PORT
-        }
     }
     
     // Connection statistics
@@ -5847,98 +4857,14 @@ class MainActivity : Activity() {
     }
     
     private fun startAuthorizationRetry() {
-        logDebug("Starting authorization retry loop")
-        
-        // Retry every 30 seconds for up to 10 minutes
-        var retryCount = 0
-        val maxRetries = 20 // 20 * 30 seconds = 10 minutes
-        
-        val retryRunnable = object : Runnable {
-            override fun run() {
-                if (retryCount >= maxRetries) {
-                    logDebug("Authorization retry timeout after 10 minutes")
-                    mainHandler.post {
-                        updateStatus("授权超时，请重新连接")
-                    }
-                    return
-                }
-                
-                retryCount++
-                logDebug("Authorization retry attempt $retryCount/$maxRetries")
-                
-                // Check if we're still connected and need authorization
-                if (webSocketClient?.isConnected() == true && authDialogShown) {
-                    mainHandler.post {
-                        updateStatus("正在检查授权状态... (${retryCount}/${maxRetries})")
-                    }
-                    
-                    // Try to register again to check if authorization is complete
-                    sendRegistration()
-                    
-                    // Schedule next retry
-                    mainHandler.postDelayed(this, 30000) // 30 seconds
-                } else {
-                    // Connection lost or authorization complete
-                    logDebug("Authorization retry stopped - connection lost or completed")
-                }
-            }
-        }
-        
-        // Start the retry loop
-        // FIX: Disable aggressive retry loop to prevent duplicate registration entries
-        // multiple requests with new Request-IDs create multiple "Pending" entries in Roon
-        // We now rely on 'com.roonlabs.registry:1/changed' event or manual retry
-        
+        // Retry loop intentionally disabled to avoid duplicate pending registrations.
+        // Authorization completion now relies on `registry/changed` or manual reconnect.
         logDebug("Authorization retry loop disabled - waiting for 'registry/changed' event or manual retry")
-        
-        // mainHandler.postDelayed(retryRunnable, 30000) // DISABLED
-    }
-    
-    private fun showAuthorizationDialog() {
-        if (authDialogShown) return
-        authDialogShown = true
-        
-        AlertDialog.Builder(this)
-            .setTitle("需要授权扩展")
-            .setMessage("请在Roon应用中完成以下步骤：\n\n" +
-                    "1. 打开Roon应用\n" +
-                    "2. 进入 Settings > Extensions\n" +
-                    "3. 找到 \"CoverArt\"\n" +
-                    "4. 点击 \"Enable\" 启用扩展\n\n" +
-                    "授权完成后，需要重新连接以获取访问令牌。")
-            .setPositiveButton("我已完成授权，重新连接") { _, _ ->
-                // Clear any old token and reconnect
-                val hostInput = getHostInput()
-                val coreId = sharedPreferences.getString("roon_core_id_$hostInput", null)
-                
-                val editor = sharedPreferences.edit()
-                // Remove old IP-based keys
-                editor.remove("roon_core_token_$hostInput")
-                editor.remove("roon_core_id_$hostInput")
-                editor.remove("roon_last_connected_$hostInput")
-                
-                // Also remove core_id-based keys if available
-                if (coreId != null) {
-                    editor.remove("roon_core_token_by_core_id_$coreId")
-                    editor.remove("roon_last_connected_by_core_id_$coreId")
-                }
-                editor.apply()
-                pairedCores.remove(hostInput)
-                
-                updateStatus("重新连接中...")
-                disconnect()
-                connect()
-            }
-            .setNegativeButton("稍后授权", null)
-            .setCancelable(true)
-            .show()
     }
     
     private fun resetDisplay() {
-        trackText.text = "无音乐播放"
-        artistText.text = "无艺术家"
-        albumText.text = "无专辑"
-        albumArtView.setImageResource(android.R.color.darker_gray)
+        updateTrackInfo("无音乐播放", "无艺术家", "无专辑")
+        updateAlbumImage(null, null)
         
         // 没有音乐播放时，直接进入艺术墙模式（不需要等待2秒）
         if (!isArtWallMode) {
@@ -5951,84 +4877,6 @@ class MainActivity : Activity() {
                 }
             }, 2000) // 给UI更新一点时间，然后进入艺术墙
         }
-    }
-    
-    private fun showPairedCores() {
-        if (pairedCores.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("已配对的Roon Core")
-                .setMessage("暂无已配对的Roon Core")
-                .setPositiveButton("确定", null)
-                .show()
-            return
-        }
-        
-        val coreList = pairedCores.values.sortedByDescending { it.lastConnected }
-        val coreNames = coreList.map { 
-            val lastConnectedStr = if (it.lastConnected > 0) {
-                val time = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
-                    .format(java.util.Date(it.lastConnected))
-                "上次连接: $time"
-            } else {
-                "未连接"
-            }
-            "${it.ip}:${it.port}\n$lastConnectedStr"
-        }.toTypedArray()
-        
-        AlertDialog.Builder(this)
-            .setTitle("已配对的Roon Core")
-            .setItems(coreNames) { _, which ->
-                val selectedCore = coreList[which]
-                setHostInput("${selectedCore.ip}:${selectedCore.port}")
-                saveIP("${selectedCore.ip}:${selectedCore.port}")
-                statusText.text = "已选择已配对的Core: ${selectedCore.ip}:${selectedCore.port}"
-            }
-            .setNegativeButton("取消", null)
-            .setNeutralButton("清除全部") { _, _ ->
-                clearAllPairedCores()
-            }
-            .show()
-    }
-    
-    private fun clearAllPairedCores() {
-        AlertDialog.Builder(this)
-            .setTitle("确认清除")
-            .setMessage("确定要清除所有已配对的Roon Core和连接历史吗？")
-            .setPositiveButton("确定") { _, _ ->
-                // Clear all pairing data
-                val editor = sharedPreferences.edit()
-                for (key in pairedCores.keys) {
-                    // Remove old IP-based keys
-                    editor.remove("roon_core_token_$key")
-                    val coreId = sharedPreferences.getString("roon_core_id_$key", null)
-                    editor.remove("roon_core_id_$key")
-                    editor.remove("roon_last_connected_$key")
-                    
-                    // Also remove core_id-based keys if available
-                    if (coreId != null) {
-                        editor.remove("roon_core_token_by_core_id_$coreId")
-                        editor.remove("roon_last_connected_by_core_id_$coreId")
-                    }
-                }
-                
-                // Clear all core_id-based tokens that might not be captured above
-                val allPrefs = sharedPreferences.all
-                allPrefs.keys.filter { 
-                    it.startsWith("roon_successful_") || 
-                    it.startsWith("roon_core_token_by_core_id_") ||
-                    it.startsWith("roon_last_connected_by_core_id_")
-                }.forEach { key ->
-                    editor.remove(key)
-                }
-                
-                editor.apply()
-                
-                pairedCores.clear()
-                statusText.text = "已清除所有数据，下次启动将进行全网扫描"
-                logDebug("Cleared all paired cores and connection history")
-            }
-            .setNegativeButton("取消", null)
-            .show()
     }
     
     private fun intToIp(ip: Int): String {
@@ -6181,64 +5029,6 @@ class MainActivity : Activity() {
         }
     }
     
-    private fun networkDiagnostics() {
-        logDebug("Starting network diagnostics")
-        statusText.text = "正在进行网络诊断..."
-        
-        GlobalScope.launch(Dispatchers.IO) {
-            try {
-                // Test UDP socket creation and binding
-                val socket = DatagramSocket()
-                socket.broadcast = true
-                socket.reuseAddress = true
-                
-                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val dhcpInfo = wifiManager.dhcpInfo
-                val localIP = intToIp(dhcpInfo.ipAddress)
-                val gateway = intToIp(dhcpInfo.gateway)
-                val netmask = intToIp(dhcpInfo.netmask)
-                
-                logDebug("Network info: Local IP: $localIP, Gateway: $gateway, Netmask: $netmask")
-                
-                // Test direct UDP to Roon IP
-                val testMessage = "UDP_TEST".toByteArray()
-                val packet = DatagramPacket(testMessage, testMessage.size, InetAddress.getByName("192.168.0.196"), 9003)
-                
-                try {
-                    socket.send(packet)
-                    logDebug("Successfully sent UDP test packet to 192.168.0.196:9003")
-                } catch (e: Exception) {
-                    logError("Failed to send UDP test packet: ${e.message}")
-                }
-                
-                // Test TCP connection to various Roon ports
-                val portsToTest = listOf(9003, 9100, 9200, ROON_WS_PORT, 9331, 9332)
-                for (port in portsToTest) {
-                    try {
-                        val tcpSocket = Socket()
-                        tcpSocket.connect(InetSocketAddress("192.168.0.196", port), 2000)
-                        tcpSocket.close()
-                        logDebug("TCP connection successful to 192.168.0.196:$port")
-                    } catch (e: Exception) {
-                        logDebug("TCP connection failed to 192.168.0.196:$port - ${e.message}")
-                    }
-                }
-                
-                socket.close()
-                
-                mainHandler.post {
-                    statusText.text = "网络诊断完成，请查看日志"
-                }
-                
-            } catch (e: Exception) {
-                logError("Network diagnostics failed: ${e.message}", e)
-                mainHandler.post {
-                    statusText.text = "网络诊断失败: ${e.message}"
-                }
-            }
-        }
-    }
-    
     // Enhanced Activity Lifecycle Management for Connection Stability
     override fun onPause() {
         super.onPause()
@@ -6344,7 +5134,6 @@ class MainActivity : Activity() {
         
         // Clean up enhanced connection monitoring
         // TODO: cleanupNetworkMonitoring()
-        // TODO: healthCheckJob?.cancel()
         
         // Cleanup message processor and resources
         cleanupMessageProcessor()
@@ -6397,17 +5186,19 @@ class MainActivity : Activity() {
             val lastHost = sharedPreferences.getString("last_successful_host", null)
             val lastPort = sharedPreferences.getInt("last_successful_port", 0)
             val lastTime = sharedPreferences.getLong("last_connection_time", 0)
-            
-            // Only try if connection was successful within the last 7 days and host is valid
-            val weekAgo = System.currentTimeMillis() - (7 * 24 * 60 * 60 * 1000L)
-            if (lastHost != null && lastPort > 0 && lastTime > weekAgo && isValidHost(lastHost)) {
+
+            val decision = autoReconnectPolicy.decide(
+                lastHost = lastHost,
+                lastPort = lastPort,
+                lastConnectionTime = lastTime,
+                isValidHost = ::isValidHost
+            )
+            if (decision.shouldReconnect) {
                 logDebug("🔄 Attempting auto-reconnect to $lastHost:$lastPort")
-                mainHandler.post {
-                    setHostInput("$lastHost:$lastPort")
-                    connect()
-                }
+                startConnectionTo(lastHost!!, lastPort)
                 return true
             }
+            logDebug("Auto-reconnect skipped: ${decision.reason}")
         } catch (e: Exception) {
             logError("Auto-reconnect failed: ${e.message}")
         }

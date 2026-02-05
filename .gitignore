@@ -3,6 +3,7 @@
 
 # IDE & tooling
 .idea/
+.vscode/
 *.iml
 .claude/
 
