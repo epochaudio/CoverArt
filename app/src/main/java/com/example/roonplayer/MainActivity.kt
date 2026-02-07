@@ -83,6 +83,10 @@ class MainActivity : Activity() {
         private const val PERMISSION_REQUEST_CODE = 123
         private const val STATUS_AUTO_CONNECT_LAST_PAIRED = "正在自动连接到上次配对的Roon Core..."
         private const val STATUS_START_AUTO_DISCOVERY = "未找到已配对的Core，正在自动发现..."
+        private const val MOO_COMPLETE_SUCCESS = "Success"
+        private const val MOO_COMPLETE_INVALID_REQUEST = "InvalidRequest"
+        private const val MOO_COMPLETE_UNSUBSCRIBED = "Unsubscribed"
+        private const val MOO_CONTINUE_SUBSCRIBED = "Subscribed"
         private val REQUIRED_PERMISSIONS = arrayOf(
             android.Manifest.permission.ACCESS_FINE_LOCATION,
             android.Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -101,7 +105,6 @@ class MainActivity : Activity() {
         // Extension registration constants
         private const val EXTENSION_ID = "com.epochaudio.coverartandroid"
         private const val DISPLAY_NAME = "CoverArt_Android"
-        private const val DISPLAY_VERSION = "2.18"
         private const val PUBLISHER = "门耳朵制作"
         private const val EMAIL = "wuzhengdong12138@gmail.com"
     }
@@ -114,6 +117,9 @@ class MainActivity : Activity() {
     private val uiTimingConfig get() = runtimeConfig.uiTiming
     private val cacheConfig get() = runtimeConfig.cache
     private val webSocketPort get() = connectionConfig.webSocketPort
+    private val registrationDisplayVersion: String by lazy {
+        resolveAppVersionName()
+    }
     
     // Screen types for responsive design
     enum class ScreenType {
@@ -3155,9 +3161,11 @@ class MainActivity : Activity() {
     private fun prepareRegisterRequest(
         includeSettings: Boolean,
         displayName: String = DISPLAY_NAME,
-        displayVersion: String = DISPLAY_VERSION
+        displayVersion: String? = null
     ): RegisterRequest {
         val requestId = nextRequestId()
+        // display_version 应与安装包真实版本保持一致，避免每次升级都手改常量导致配对页版本滞后。
+        val effectiveDisplayVersion = displayVersion?.takeIf { it.isNotBlank() } ?: registrationDisplayVersion
 
         val hostInput = getHostInput()
         val savedToken = pairedCoreRepository.getSavedToken(hostInput)
@@ -3165,7 +3173,7 @@ class MainActivity : Activity() {
         val body = JSONObject().apply {
             put("extension_id", EXTENSION_ID)
             put("display_name", displayName)
-            put("display_version", displayVersion)
+            put("display_version", effectiveDisplayVersion)
             put("publisher", PUBLISHER)
             put("email", "masked")
             put("website", "https://shop236654229.taobao.com/")
@@ -3206,6 +3214,17 @@ class MainActivity : Activity() {
         logDebug("Register hex: ${mooMessage.toByteArray().take(120).joinToString(" ") { "%02x".format(it) }}...")
 
         return RegisterRequest(requestId, mooMessage, savedToken != null)
+    }
+
+    private fun resolveAppVersionName(): String {
+        return try {
+            @Suppress("DEPRECATION")
+            val packageInfo = packageManager.getPackageInfo(packageName, 0)
+            packageInfo.versionName?.trim().orEmpty().ifBlank { "unknown" }
+        } catch (e: Exception) {
+            logWarning("Failed to resolve app version for registration: ${e.message}")
+            "unknown"
+        }
     }
 
     private fun sendRegistration() {
@@ -3366,6 +3385,15 @@ class MainActivity : Activity() {
                              val response = "MOO/1 COMPLETE $servicePath\nRequest-Id: $requestId\nContent-Type: application/json\nContent-Length: 0\n\n"
                              sendMoo(response)
                          }
+                        servicePath.contains("settings") -> {
+                            // Roon 会以 REQUEST 调用扩展 settings 服务；必须在 REQUEST 分支直接处理。
+                            // 若被 generic REQUEST 兜底吞掉，只会返回空响应，设置页就会失去 Zone 选择控件。
+                            handleSettingsProtocolMessage(
+                                servicePath = servicePath,
+                                originalMessage = message,
+                                payload = jsonBody
+                            )
+                         }
                          else -> {
                              logDebug("Received generic REQUEST: $servicePath")
                              // Acknowledge to be polite
@@ -3392,24 +3420,8 @@ class MainActivity : Activity() {
                             handleImageResponse(jsonBody, message)
                         }
                         servicePath.contains("settings") -> {
-                            logDebug("=== Settings Service Message ===")
-                            logDebug("Service path: $servicePath")
-                            logDebug("Message body: $jsonBody")
-                            
-                            jsonBody?.let { 
-                                val response = roonApiSettings.handleSettingsMessage(it)
-                                response?.let { resp -> 
-                                    logDebug("Sending settings response: $resp")
-                                    // 修复：发送正确的MOO协议响应
-                                    sendSettingsResponse(message, resp)
-                                } ?: run {
-                                    logWarning("Settings handler returned null response")
-                                    sendSettingsError(message, "Settings data not available")
-                                }
-                            } ?: run {
-                                logWarning("Settings message with null body")
-                                sendSettingsError(message, "Invalid settings request")
-                            }
+                            // settings 服务由 Roon Core 主动 REQUEST，RESPONSE 分支不应再次回包，避免协议环路。
+                            logDebug("Ignore settings RESPONSE message: $servicePath")
                         }
                     }
                 }
@@ -3421,24 +3433,8 @@ class MainActivity : Activity() {
                             handleRegistrationResponse(jsonBody)
                         }
                         servicePath.contains("settings") -> {
-                            logDebug("=== Settings CONTINUE Message ===")
-                            logDebug("Service path: $servicePath")
-                            logDebug("Message body: $jsonBody")
-                            
-                            jsonBody?.let { 
-                                val response = roonApiSettings.handleSettingsMessage(it)
-                                response?.let { resp -> 
-                                    logDebug("Sending settings CONTINUE response: $resp")
-                                    // 修复：发送正确的MOO协议响应
-                                    sendSettingsResponse(message, resp)
-                                } ?: run {
-                                    logWarning("Settings CONTINUE handler returned null response")
-                                    sendSettingsError(message, "Settings data not available")
-                                }
-                            } ?: run {
-                                logWarning("Settings CONTINUE message with null body")
-                                sendSettingsError(message, "Invalid settings request")
-                            }
+                            // settings 服务不依赖 CONTINUE 事件，记录日志便于诊断即可。
+                            logDebug("Ignore settings CONTINUE message: $servicePath")
                         }
                         jsonBody?.has("zones") == true -> {
                             handleZoneUpdate(jsonBody)
@@ -4144,6 +4140,40 @@ class MainActivity : Activity() {
         }
         return "com.roonlabs.settings:1/get_settings" // fallback
     }
+
+    /**
+     * 统一处理 settings service 请求，避免 REQUEST/RESPONSE/CONTINUE 分支各自解析导致行为漂移。
+     */
+    private fun handleSettingsProtocolMessage(
+        servicePath: String,
+        originalMessage: String,
+        payload: JSONObject?
+    ) {
+        try {
+            logDebug("=== Settings Service Message ===")
+            logDebug("Service path: $servicePath")
+            logDebug("Message body: $payload")
+
+            when {
+                servicePath.endsWith("/subscribe_settings") -> {
+                    // 官方 settings 协议在 subscribe_settings 上使用 CONTINUE Subscribed 回包。
+                    val settingsResponse = roonApiSettings.getSettings()
+                    sendSettingsSubscribed(originalMessage, settingsResponse)
+                }
+                servicePath.endsWith("/unsubscribe_settings") -> {
+                    sendSettingsUnsubscribed(originalMessage)
+                }
+                else -> {
+                    val settingsResponse = roonApiSettings.handleSettingsServiceRequest(servicePath, payload)
+                    logDebug("Sending settings response: $settingsResponse")
+                    sendSettingsResponse(originalMessage, settingsResponse)
+                }
+            }
+        } catch (e: Exception) {
+            logError("Failed to process settings request: ${e.message}", e)
+            sendSettingsError(originalMessage, "Settings request processing failed")
+        }
+    }
     
     /**
      * 发送正确的MOO协议Settings响应，镜像原始服务路径
@@ -4151,7 +4181,8 @@ class MainActivity : Activity() {
     private fun sendSettingsResponse(originalMessage: String, settingsData: JSONObject) {
         try {
             val requestId = extractRequestId(originalMessage)
-            val servicePath = extractServicePath(originalMessage)
+            // 按 node-roon-api 的 MooMessage 语义，COMPLETE 第三段是状态名（Success / InvalidRequest），
+            // settings 方法返回值需要放在 settings 字段下，Roon 才会按扩展设置布局渲染控件。
             val responseBody = JSONObject().apply {
                 put("settings", settingsData)
             }
@@ -4159,7 +4190,7 @@ class MainActivity : Activity() {
             val responseBodyBytes = responseBodyString.toByteArray(Charsets.UTF_8)
             
             val mooResponse = buildString {
-                append("MOO/1 COMPLETE $servicePath\n")
+                append("MOO/1 COMPLETE $MOO_COMPLETE_SUCCESS\n")
                 append("Request-Id: $requestId\n")
                 append("Content-Type: application/json\n")
                 append("Content-Length: ${responseBodyBytes.size}\n")
@@ -4173,6 +4204,56 @@ class MainActivity : Activity() {
             logError("Failed to send settings response", e)
         }
     }
+
+    /**
+     * subscribe_settings 的标准应答：CONTINUE Subscribed + settings 布局
+     */
+    private fun sendSettingsSubscribed(originalMessage: String, settingsData: JSONObject) {
+        try {
+            val requestId = extractRequestId(originalMessage)
+            val responseBody = JSONObject().apply {
+                put("settings", settingsData)
+            }
+            val responseBodyString = responseBody.toString()
+            val responseBodyBytes = responseBodyString.toByteArray(Charsets.UTF_8)
+
+            val mooResponse = buildString {
+                append("MOO/1 CONTINUE $MOO_CONTINUE_SUBSCRIBED\n")
+                append("Request-Id: $requestId\n")
+                append("Content-Type: application/json\n")
+                append("Content-Length: ${responseBodyBytes.size}\n")
+                append("\n")
+                append(responseBodyString)
+            }
+
+            logDebug("Sending MOO Settings subscribed response: $mooResponse")
+            sendMoo(mooResponse)
+        } catch (e: Exception) {
+            logError("Failed to send subscribed settings response", e)
+        }
+    }
+
+    /**
+     * unsubscribe_settings 的标准应答：COMPLETE Unsubscribed
+     */
+    private fun sendSettingsUnsubscribed(originalMessage: String) {
+        try {
+            val requestId = extractRequestId(originalMessage)
+
+            val mooResponse = buildString {
+                append("MOO/1 COMPLETE $MOO_COMPLETE_UNSUBSCRIBED\n")
+                append("Request-Id: $requestId\n")
+                append("Content-Type: application/json\n")
+                append("Content-Length: 0\n")
+                append("\n")
+            }
+
+            logDebug("Sending MOO Settings unsubscribed response: $mooResponse")
+            sendMoo(mooResponse)
+        } catch (e: Exception) {
+            logError("Failed to send unsubscribed settings response", e)
+        }
+    }
     
     /**
      * 发送Settings错误响应，镜像原始服务路径
@@ -4180,7 +4261,6 @@ class MainActivity : Activity() {
     private fun sendSettingsError(originalMessage: String, errorMessage: String) {
         try {
             val requestId = extractRequestId(originalMessage)
-            val servicePath = extractServicePath(originalMessage)
             val errorResponse = JSONObject().apply {
                 put("error", errorMessage)
                 put("has_error", true)
@@ -4189,7 +4269,7 @@ class MainActivity : Activity() {
             val errorResponseBytes = errorResponseString.toByteArray(Charsets.UTF_8)
             
             val mooResponse = buildString {
-                append("MOO/1 COMPLETE $servicePath\n")
+                append("MOO/1 COMPLETE $MOO_COMPLETE_INVALID_REQUEST\n")
                 append("Request-Id: $requestId\n")
                 append("Content-Type: application/json\n")
                 append("Content-Length: ${errorResponseBytes.size}\n")

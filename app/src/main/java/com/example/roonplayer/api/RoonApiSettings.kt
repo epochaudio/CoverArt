@@ -16,6 +16,23 @@ class RoonApiSettings(
 ) {
     companion object {
         private const val TAG = "RoonApiSettings"
+        private const val REQUEST_GET_SETTINGS = "get_settings"
+        private const val REQUEST_SAVE_SETTINGS = "save_settings"
+        private const val KEY_SETTINGS = "settings"
+        private const val KEY_VALUES = "values"
+        private const val KEY_BODY = "body"
+        private const val KEY_DRY_RUN = "dry_run"
+        private const val KEY_IS_DRY_RUN = "is_dry_run"
+        private const val KEY_IS_DRY_RUN_CAMEL = "isDryRun"
+        private const val KEY_OUTPUT = "output"
+        private const val KEY_ZONE = "zone"
+        private const val KEY_OUTPUT_ID = "output_id"
+        private const val KEY_DISPLAY_NAME = "display_name"
+        private const val KEY_LAYOUT = "layout"
+        private const val KEY_HAS_ERROR = "has_error"
+        private const val LAYOUT_TYPE_ZONE = "zone"
+        private const val OUTPUT_SETTING = KEY_ZONE
+        private const val OUTPUT_TITLE = "选择播放区域"
     }
     
     private var currentSettings = mutableMapOf<String, Any>()
@@ -29,47 +46,32 @@ class RoonApiSettings(
      * 创建Settings布局 - 按照官方格式
      */
     private fun makeLayout(settings: Map<String, Any>): JSONObject {
-        val hasValidZoneData = hasValidZoneData()
-        
-        return JSONObject().apply {
-            put("values", JSONObject().apply {
-                // 将设置值转换为JSON
+        val normalizedValues = normalizeSettingsValues(
+            JSONObject().apply {
                 for ((key, value) in settings) {
                     put(key, value)
                 }
-            })
-            put("layout", JSONArray().apply {
-                // 只有在Zone数据可用时才显示zone选择器
-                if (hasValidZoneData) {
-                    put(JSONObject().apply {
-                        put("type", "zone")
-                        put("title", "选择播放区域")
-                        put("setting", "output")
-                    })
-                } else {
-                    // Zone数据不可用时显示提示信息
-                    put(JSONObject().apply {
-                        put("type", "label")
-                        put("title", "正在加载Zone数据...")
-                    })
-                }
-            })
-            put("has_error", !hasValidZoneData)
+            }
+        )
+        val settingsValues = JSONObject().apply {
+            // zone 控件只读取与其同名 setting 的值；输出单一 source-of-truth 可避免保存时回传旧值。
+            normalizedValues.optJSONObject(KEY_ZONE)?.let { zoneValue ->
+                put(KEY_ZONE, JSONObject(zoneValue.toString()))
+            }
         }
-    }
-    
-    /**
-     * 检查Zone数据是否有效
-     */
-    private fun hasValidZoneData(): Boolean {
-        return try {
-            val zones = getAvailableZones()
-            val hasZones = zones.isNotEmpty()
-            Log.d(TAG, "Zone data validation: hasZones=$hasZones, count=${zones.size}")
-            hasZones
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking zone data: ${e.message}")
-            false
+
+        // Settings UI 由 Roon Core 渲染并维护可选 Zone 列表。
+        // 这里必须始终返回 zone 控件，不能依赖客户端本地 zones 缓存，否则会出现“设置弹窗无可选项”。
+        return JSONObject().apply {
+            put(KEY_VALUES, settingsValues)
+            put(KEY_LAYOUT, JSONArray().apply {
+                put(JSONObject().apply {
+                    put("type", LAYOUT_TYPE_ZONE)
+                    put("title", OUTPUT_TITLE)
+                    put("setting", OUTPUT_SETTING)
+                })
+            })
+            put(KEY_HAS_ERROR, false)
         }
     }
     
@@ -86,18 +88,19 @@ class RoonApiSettings(
      * 处理save_settings请求 - 官方API回调格式
      */
     fun saveSettings(newSettings: JSONObject, isDryRun: Boolean): JSONObject {
-        Log.d(TAG, "Save settings - isDryRun: $isDryRun, values: $newSettings")
+        val normalizedSettings = normalizeSettingsValues(newSettings)
+        Log.d(TAG, "Save settings - isDryRun: $isDryRun, values: $normalizedSettings")
+
+        val settingsMap = convertJsonToMap(normalizedSettings)
+        val layout = makeLayout(settingsMap)
         
-        val layout = makeLayout(convertJsonToMap(newSettings))
-        
-        if (!isDryRun && !layout.optBoolean("has_error", false)) {
-            // 保存设置
-            currentSettings = convertJsonToMap(newSettings)
+        if (!isDryRun) {
+            // 非 dry-run 才允许落库，避免 Roon 预检阶段污染本地状态。
+            currentSettings = settingsMap
             persistSettings()
             
             // 通知Zone配置变化
-            val outputValue = newSettings.optJSONObject("output")
-            val outputId = outputValue?.optString("output_id")
+            val outputId = extractOutputId(normalizedSettings)
             if (outputId != null) {
                 // 找到对应的zone_id并通知
                 val zoneId = findZoneIdByOutputId(outputId)
@@ -107,14 +110,13 @@ class RoonApiSettings(
                 } else {
                     Log.w(TAG, "Output selected but zone not available yet: $outputId")
                 }
+            } else {
+                Log.w(TAG, "save_settings committed without output_id: $normalizedSettings")
             }
         }
         
-        // 修复：返回正确的Settings响应格式
-        return JSONObject().apply {
-            put("status", if (layout.optBoolean("has_error", false)) "Error" else "Success")
-            put("settings", layout)
-        }
+        // Settings 服务响应体应直接返回 settings layout 对象，外层由调用方包装。
+        return layout
     }
     
     /**
@@ -139,32 +141,18 @@ class RoonApiSettings(
             Log.d(TAG, "Request type: $request")
             
             when (request) {
-                "get_settings" -> {
+                REQUEST_GET_SETTINGS -> {
                     Log.d(TAG, "Processing get_settings request")
-                    
-                    // 检查Zone数据是否可用
-                    if (!hasValidZoneData()) {
-                        Log.w(TAG, "Zone data not available for get_settings")
-                        // 仍然返回布局，但标记为错误状态
-                    }
-                    
                     val response = getSettings()
                     Log.d(TAG, "get_settings response: $response")
                     response
                 }
-                "save_settings" -> {
+                REQUEST_SAVE_SETTINGS -> {
                     Log.d(TAG, "Processing save_settings request")
-                    val body = message.optJSONObject("body")
-                    val isDryRun = body?.optBoolean("dry_run", false) ?: false
-                    val newSettings = body?.optJSONObject("settings") ?: JSONObject()
+                    val body = message.optJSONObject(KEY_BODY)
+                    val isDryRun = extractDryRun(body)
+                    val newSettings = extractSettingsValues(body)
                     Log.d(TAG, "save_settings - dry_run: $isDryRun, settings: $newSettings")
-                    
-                    // 验证设置数据
-                    if (!isDryRun && !hasValidZoneData()) {
-                        Log.e(TAG, "Cannot save settings: Zone data not available")
-                        return createErrorResponse("Zone data not available")
-                    }
-                    
                     val response = saveSettings(newSettings, isDryRun)
                     Log.d(TAG, "save_settings response: $response")
                     response
@@ -189,12 +177,147 @@ class RoonApiSettings(
         return JSONObject().apply {
             put("status", "Error")
             put("error", errorMessage)
-            put("settings", JSONObject().apply {
-                put("values", JSONObject())
-                put("layout", JSONArray())
-                put("has_error", true)
+            put(KEY_SETTINGS, JSONObject().apply {
+                put(KEY_VALUES, JSONObject())
+                put(KEY_LAYOUT, JSONArray())
+                put(KEY_HAS_ERROR, true)
             })
         }
+    }
+
+    /**
+     * 基于 settings servicePath 解析并处理请求。
+     * 兼容不同封装格式（settings/values/body）的 save_settings 载荷，避免协议差异导致设置页失效。
+     */
+    fun handleSettingsServiceRequest(servicePath: String, payload: JSONObject?): JSONObject {
+        val requestType = when {
+            servicePath.endsWith("/get_settings") -> REQUEST_GET_SETTINGS
+            servicePath.endsWith("/save_settings") -> REQUEST_SAVE_SETTINGS
+            else -> payload?.optString("request", REQUEST_GET_SETTINGS) ?: REQUEST_GET_SETTINGS
+        }
+        return when (requestType) {
+            REQUEST_GET_SETTINGS -> getSettings()
+            REQUEST_SAVE_SETTINGS -> {
+                val isDryRun = extractDryRun(payload)
+                val newSettings = extractSettingsValues(payload)
+                saveSettings(newSettings, isDryRun)
+            }
+            else -> {
+                Log.w(TAG, "Unsupported settings request type: $requestType, path=$servicePath")
+                makeLayout(currentSettings)
+            }
+        }
+    }
+
+    private fun extractDryRun(payload: JSONObject?): Boolean {
+        if (payload == null) return false
+        extractDryRunFromContainer(payload)?.let { return it }
+        payload.optJSONObject(KEY_BODY)?.let { nestedBody ->
+            extractDryRunFromContainer(nestedBody)?.let { return it }
+        }
+        payload.optJSONObject(KEY_SETTINGS)?.let { nestedSettings ->
+            extractDryRunFromContainer(nestedSettings)?.let { return it }
+        }
+        return false
+    }
+
+    private fun extractSettingsValues(payload: JSONObject?): JSONObject {
+        if (payload == null) return JSONObject()
+
+        extractValuesFromContainer(payload)?.let { return it }
+
+        val nestedBody = payload.optJSONObject(KEY_BODY)
+        if (nestedBody != null) {
+            extractValuesFromContainer(nestedBody)?.let { return it }
+        }
+
+        val nestedSettings = payload.optJSONObject(KEY_SETTINGS)
+        if (nestedSettings != null) {
+            extractValuesFromContainer(nestedSettings)?.let { return it }
+        }
+
+        return JSONObject()
+    }
+
+    private fun extractDryRunFromContainer(container: JSONObject): Boolean? {
+        return when {
+            container.has(KEY_IS_DRY_RUN) -> container.optBoolean(KEY_IS_DRY_RUN)
+            container.has(KEY_DRY_RUN) -> container.optBoolean(KEY_DRY_RUN)
+            container.has(KEY_IS_DRY_RUN_CAMEL) -> container.optBoolean(KEY_IS_DRY_RUN_CAMEL)
+            else -> null
+        }
+    }
+
+    private fun extractValuesFromContainer(container: JSONObject): JSONObject? {
+        container.optJSONObject(KEY_SETTINGS)?.let { settingsObject ->
+            settingsObject.optJSONObject(KEY_VALUES)?.let { values ->
+                return normalizeSettingsValues(values)
+            }
+            if (looksLikeSettingsValues(settingsObject)) {
+                return normalizeSettingsValues(settingsObject)
+            }
+        }
+
+        container.optJSONObject(KEY_VALUES)?.let { values ->
+            return normalizeSettingsValues(values)
+        }
+
+        if (looksLikeSettingsValues(container)) {
+            return normalizeSettingsValues(container)
+        }
+
+        return null
+    }
+
+    private fun looksLikeSettingsValues(candidate: JSONObject): Boolean {
+        return candidate.has(KEY_OUTPUT) || candidate.has(KEY_ZONE) || candidate.has(KEY_OUTPUT_ID)
+    }
+
+    private fun normalizeSettingsValues(values: JSONObject): JSONObject {
+        val normalized = JSONObject(values.toString())
+
+        // zone 是当前布局(setting=zone)的权威值；若与 output 冲突，用 zone 覆盖 output。
+        val zoneOutputId = normalized.optJSONObject(KEY_ZONE)?.optString(KEY_OUTPUT_ID)?.takeIf { it.isNotBlank() }
+        if (zoneOutputId != null) {
+            normalized.put(KEY_OUTPUT, JSONObject(normalized.optJSONObject(KEY_ZONE).toString()))
+        }
+
+        if (!normalized.has(KEY_ZONE)) {
+            normalized.optJSONObject(KEY_OUTPUT)?.let { outputObject ->
+                // 一些客户端以 output 键回传，补齐 zone 键可提升 Roon UI 兼容性。
+                normalized.put(KEY_ZONE, JSONObject(outputObject.toString()))
+            }
+        }
+
+        if (!normalized.has(KEY_OUTPUT)) {
+            normalized.optJSONObject(KEY_ZONE)?.let { zoneObject ->
+                // 官方示例常用 "zone"，内部统一成 "output" 方便复用原有存储键。
+                normalized.put(KEY_OUTPUT, JSONObject(zoneObject.toString()))
+            }
+        }
+
+        if (!normalized.has(KEY_OUTPUT) && !normalized.has(KEY_ZONE)) {
+            val directOutputId = normalized.optString(KEY_OUTPUT_ID, "")
+            if (directOutputId.isNotBlank()) {
+                val outputObject = JSONObject().apply {
+                    put(KEY_OUTPUT_ID, directOutputId)
+                }
+                normalized.put(KEY_OUTPUT, JSONObject(outputObject.toString()))
+                normalized.put(KEY_ZONE, JSONObject(outputObject.toString()))
+            }
+        }
+
+        return normalized
+    }
+
+    private fun extractOutputId(settingsValues: JSONObject): String? {
+        val outputObject = settingsValues.optJSONObject(KEY_ZONE)
+            ?: settingsValues.optJSONObject(KEY_OUTPUT)
+        val objectOutputId = outputObject?.optString(KEY_OUTPUT_ID)?.takeIf { it.isNotBlank() }
+        if (objectOutputId != null) {
+            return objectOutputId
+        }
+        return settingsValues.optString(KEY_OUTPUT_ID).takeIf { it.isNotBlank() }
     }
     
     /**
@@ -207,10 +330,11 @@ class RoonApiSettings(
         if (savedOutput != null) {
             // 创建output对象
             val outputObj = JSONObject().apply {
-                put("output_id", savedOutput)
-                put("display_name", "Saved Zone")
+                put(KEY_OUTPUT_ID, savedOutput)
+                put(KEY_DISPLAY_NAME, "Saved Zone")
             }
-            currentSettings["output"] = outputObj
+            currentSettings[KEY_OUTPUT] = outputObj
+            currentSettings[KEY_ZONE] = JSONObject(outputObj.toString())
             Log.d(TAG, "Loaded saved output: $savedOutput")
 
             // 统一回写主键，完成 legacy key 向 OUTPUT_ID_KEY 的收敛
@@ -222,9 +346,14 @@ class RoonApiSettings(
      * 保存设置到SharedPreferences
      */
     private fun persistSettings() {
-        // 保存output设置
-        val outputObj = currentSettings["output"] as? JSONObject
-        val outputId = outputObj?.optString("output_id")
+        val settingsAsJson = JSONObject().apply {
+            for ((key, value) in currentSettings) {
+                put(key, value)
+            }
+        }
+
+        // 保存output设置（兼容 output/zone 两种字段）
+        val outputId = extractOutputId(settingsAsJson)
         if (outputId != null) {
             // 找到对应的zone_id
             val zoneId = findZoneIdByOutputId(outputId)

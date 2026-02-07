@@ -37,7 +37,11 @@
 - Contract doc: `docs/runtime-config-contract.md`.
 
 ### 📦 Version History
-- **2.18 (Latest)**:
+- **2.19 (Latest)**:
+  - **Settings Fix**: Fixed settings service request routing so Zone selector is correctly rendered in Roon extension settings.
+  - **Settings Compatibility**: Improved `get_settings/save_settings` payload compatibility to prevent empty settings dialogs.
+  - **Settings Protocol Alignment**: Aligned `subscribe_settings/unsubscribe_settings` handshake with Roon behavior (`CONTINUE Subscribed`, `COMPLETE Unsubscribed`) for stable settings rendering.
+  - **Zone Save Effectiveness**: Use `zone` as the canonical settings key so selected zone is applied to the app immediately after saving.
   - **Protocol Hardening**: Integrated `SimpleWebSocketClient` with synchronous handshake logic for more reliable connections.
   - **Moo Protocol**: Implemented `MooParser` and `MooMessage` for robust message parsing and handling.
   - **Stability**: Fixed race conditions during Roon Core discovery and registration phases.
@@ -92,7 +96,11 @@
 - **状态提示**：底部状态栏展示连接、授权、区域选择等细节，出现告警（网络中断、区域失效）时便于定位。
 
 ### 📦 版本信息
-- **2.18 (Latest)**:
+- **2.19 (Latest)**:
+  - **Settings 修复**: 修复 settings 服务请求路由，Roon 扩展设置页可正确渲染 Zone 选择器。
+  - **Settings 兼容性**: 增强 `get_settings/save_settings` 载荷兼容，避免设置弹窗出现空白配置。
+  - **Settings 协议对齐**: 将 `subscribe_settings/unsubscribe_settings` 对齐到 Roon 期望握手（`CONTINUE Subscribed`、`COMPLETE Unsubscribed`），设置页渲染更稳定。
+  - **Zone 保存生效**: 以 `zone` 作为设置主键，保存后可立即在 App 端应用所选 Zone。
   - **协议强化**: 引入 `SimpleWebSocketClient` 配合同步握手逻辑，连接更稳定。
   - **Moo 协议**: 实现 `MooParser` 和 `MooMessage`，提升消息解析的安全性和准确性。
   - **稳定性修复**: 修复了 Roon Core 发现与注册阶段的竞态条件问题。
@@ -102,48 +110,7 @@
   - **艺术墙优化**: 适配服务端随机图片 API，提升加载效率与内容多样性。
   - **架构统一**: 统一 WebSocket 客户端与注册流程；引入 core_id Token 管理与自动迁移。
 
-### 🧭 架构审查与改造路线（2026-02）
-#### 审查背景
-- 目标：识别逻辑重复、冗余和高风险错误，制定“先止血后重构”的低风险路线。
-- 范围：
-  - `app/src/main/java/com/example/roonplayer/MainActivity.kt`
-  - `app/src/main/java/com/example/roonplayer/api/RoonApiSettings.kt`
-  - `app/src/main/java/com/example/roonplayer/network/*`
-- 方法：静态审查 + 编译验证（`./gradlew :app:compileDebugKotlin`）。
-
-#### 关键问题分级
-- `P0`：
-  - Zone 失效时缺少回退，导致有可用 Zone 仍可能“无内容”。
-  - 健康监控生命周期不闭合，断开后可能继续监控旧连接。
-  - 重连入口并发，`connect()` 防重不足，可能重复连接/注册。
-  - `token` 持久化读取链路分叉（`core_id` 与 host 口径不一致）。
-- `P1`：
-  - 部分后台线程直接写 UI。
-  - Zone 配置逻辑在 `MainActivity` 与 `RoonApiSettings` 重复实现。
-  - `TrackState/UIState/控件直写` 并行，破坏单一事实源。
-- `P2`：
-  - 冗余/死路径较多。
-  - 存在无效空值保护写法（如 `sendMoo(): Unit` 后接 Elvis）。
-
-#### 最小风险改造清单（提交粒度）
-- 阶段 A（先止血）：
-  - `A1` Zone 失效回退
-  - `A2` 健康监控生命周期绑定
-  - `A3` 连接去重与并发防护
-  - `A4` UI 主线程写入收口
-  - `A5` 配对数据读取一致化
-- 阶段 B（后重构）：
-  - `B1` 提取 `ZoneConfigRepository`
-  - `B2` 提取 `ZoneSelectionUseCase`
-  - `B3` 连接编排收敛
-  - `B4` 状态模型收口（单一事实源）
-  - `B5` 清理死代码与历史分支
-  - `B6` 补齐回归测试（Zone 回退、连接防重、token 迁移、监控生命周期）
-
-#### 当前实施进度
-- 已完成：`A1-A5`、`B1-B6`（含核心 JVM 单测）。
-- 本轮补充：WebSocket 日志止血（关闭逐帧噪声，保留生命周期日志）。
-
+ 
 ### 🤝 支持
 若有问题或建议：
 1. 确认使用最新版本并重试连接。
