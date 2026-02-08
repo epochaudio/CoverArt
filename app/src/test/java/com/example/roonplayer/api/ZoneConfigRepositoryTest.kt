@@ -21,7 +21,6 @@ class ZoneConfigRepositoryTest {
         val repo = ZoneConfigRepository(prefs)
 
         val zoneId = repo.loadZoneConfiguration(
-            hostInput = "192.168.1.10:9330",
             findZoneIdByOutputId = { "should_not_be_called" }
         )
 
@@ -30,19 +29,15 @@ class ZoneConfigRepositoryTest {
 
     @Test
     fun `migrates legacy core scoped zone config`() {
-        val hostInput = "192.168.1.11:9330"
-        val coreId = "core_123"
-        val legacyKey = "configured_zone_$coreId"
+        val legacyKey = "configured_zone_core_123"
         val prefs = FakeSharedPreferences(
             mutableMapOf(
-                "roon_core_id_$hostInput" to coreId,
                 legacyKey to "zone_legacy"
             )
         )
         val repo = ZoneConfigRepository(prefs)
 
         val zoneId = repo.loadZoneConfiguration(
-            hostInput = hostInput,
             findZoneIdByOutputId = { null }
         )
 
@@ -62,7 +57,6 @@ class ZoneConfigRepositoryTest {
         val repo = ZoneConfigRepository(prefs)
 
         val zoneId = repo.loadZoneConfiguration(
-            hostInput = hostInput,
             findZoneIdByOutputId = { outputId ->
                 if (outputId == "output_abc") "zone_from_output" else null
             }
@@ -83,7 +77,7 @@ class ZoneConfigRepositoryTest {
         )
         val repo = ZoneConfigRepository(prefs)
 
-        val outputId = repo.getStoredOutputId(hostInput)
+        val outputId = repo.getStoredOutputId()
 
         assertEquals("output_main", outputId)
     }

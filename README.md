@@ -37,7 +37,11 @@
 - Contract doc: `docs/runtime-config-contract.md`.
 
 ### 📦 Version History
-- **2.20 (Latest)**:
+- **2.21 (Latest)**:
+  - **UI Language**: Switched all on-screen UI status/empty placeholders to English.
+  - **Status Overlay**: Added a small status overlay that stays hidden during normal playback. Both Art Wall and single-cover display remain clean; the overlay appears only for actionable alerts (authorization required, disconnected after a short grace window, errors/warnings).
+  - **First Pairing Hint**: When no saved token exists, the app will surface the "Enable the extension in Roon" instructions automatically if pairing doesn't complete in time.
+- **2.20**:
   - **Settings Fix**: Fixed settings service request routing so Zone selector is correctly rendered in Roon extension settings.
   - **Settings Compatibility**: Improved `get_settings/save_settings` payload compatibility to prevent empty settings dialogs.
   - **Settings Protocol Alignment**: Aligned `subscribe_settings/unsubscribe_settings` handshake with Roon behavior (`CONTINUE Subscribed`, `COMPLETE Unsubscribed`) for stable settings rendering.
@@ -97,7 +101,11 @@
 - **状态提示**：底部状态栏展示连接、授权、区域选择等细节，出现告警（网络中断、区域失效）时便于定位。
 
 ### 📦 版本信息
-- **2.20 (Latest)**:
+- **2.21 (Latest)**:
+  - **界面英文**: 将启动/连接/空白专辑等用户可见文案统一切换为英文。
+  - **状态可见性**: 增加轻量状态提示层（封面墙 + 单封面）在正常播放/正常连接时默认隐藏；仅在异常或需要动作时显示（等待授权、断线超过宽限期、错误/告警）。
+  - **首次配对提示**: 当本地无 token 且配对未及时完成时，会自动提示用户到 Roon 里启用扩展完成授权。
+- **2.20**:
   - **Settings 修复**: 修复 settings 服务请求路由，Roon 扩展设置页可正确渲染 Zone 选择器。
   - **Settings 兼容性**: 增强 `get_settings/save_settings` 载荷兼容，避免设置弹窗出现空白配置。
   - **Settings 协议对齐**: 将 `subscribe_settings/unsubscribe_settings` 对齐到 Roon 期望握手（`CONTINUE Subscribed`、`COMPLETE Unsubscribed`），设置页渲染更稳定。

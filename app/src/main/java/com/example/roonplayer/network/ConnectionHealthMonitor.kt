@@ -32,11 +32,11 @@ class ConnectionHealthMonitor(
         onHealthChange: (HealthStatus) -> Unit
     ) {
         if (isMonitoring) {
-            Log.w(TAG, "健康监控已在运行")
+            Log.w(TAG, "Health monitor is already running")
             return
         }
 
-        Log.i(TAG, "开始健康监控: $ip:$port")
+        Log.i(TAG, "Starting health monitor: $ip:$port")
         isMonitoring = true
         consecutiveFailures = 0
         currentInterval = defaultCheckIntervalMs
@@ -50,8 +50,8 @@ class ConnectionHealthMonitor(
                     adjustMonitoringInterval(healthStatus)
                     
                 } catch (e: Exception) {
-                    Log.e(TAG, "健康检查过程中发生错误", e)
-                    onHealthChange(HealthStatus.Error("健康检查错误: ${e.message}"))
+                    Log.e(TAG, "Error during health check", e)
+                    onHealthChange(HealthStatus.Error("Health check error: ${e.message}"))
                 }
 
                 delay(currentInterval)
@@ -60,7 +60,7 @@ class ConnectionHealthMonitor(
     }
 
     fun stopMonitoring() {
-        Log.i(TAG, "停止健康监控")
+        Log.i(TAG, "Stopping health monitor")
         isMonitoring = false
         monitoringJob?.cancel()
         monitoringScope.coroutineContext.cancelChildren()
@@ -70,19 +70,19 @@ class ConnectionHealthMonitor(
     }
 
     private suspend fun checkConnectionHealth(ip: String, port: Int): HealthStatus = withContext(Dispatchers.IO) {
-        Log.d(TAG, "执行健康检查: $ip:$port")
+        Log.d(TAG, "Running health check: $ip:$port")
 
         try {
             when (val result = connectionValidator.validateConnection(ip, port)) {
                 is RoonConnectionValidator.ConnectionResult.Success -> {
-                    Log.d(TAG, "健康检查成功")
+                    Log.d(TAG, "Health check succeeded")
                     consecutiveFailures = 0
                     HealthStatus.Healthy
                 }
                 
                 is RoonConnectionValidator.ConnectionResult.Timeout -> {
                     consecutiveFailures++
-                    Log.w(TAG, "健康检查超时 (连续失败: $consecutiveFailures)")
+                    Log.w(TAG, "Health check timeout (consecutive failures: $consecutiveFailures)")
                     
                     when {
                         consecutiveFailures >= 3 -> HealthStatus.Unhealthy
@@ -93,7 +93,7 @@ class ConnectionHealthMonitor(
                 
                 is RoonConnectionValidator.ConnectionResult.NetworkError -> {
                     consecutiveFailures++
-                    Log.w(TAG, "健康检查网络错误 (连续失败: $consecutiveFailures)")
+                    Log.w(TAG, "Health check network error (consecutive failures: $consecutiveFailures)")
                     
                     when {
                         consecutiveFailures >= 2 -> HealthStatus.Unhealthy
@@ -102,15 +102,15 @@ class ConnectionHealthMonitor(
                 }
                 
                 is RoonConnectionValidator.ConnectionResult.InvalidCore -> {
-                    Log.e(TAG, "健康检查发现无效Core: ${result.message}")
+                    Log.e(TAG, "Health check found invalid Core: ${result.message}")
                     HealthStatus.Error(result.message)
                 }
             }
             
         } catch (e: Exception) {
             consecutiveFailures++
-            Log.e(TAG, "健康检查异常", e)
-            HealthStatus.Error("健康检查异常: ${e.message}")
+            Log.e(TAG, "Health check exception", e)
+            HealthStatus.Error("Health check exception: ${e.message}")
         }
     }
 
@@ -125,7 +125,7 @@ class ConnectionHealthMonitor(
         }
 
         if (newInterval != currentInterval) {
-            Log.d(TAG, "调整监控间隔: ${currentInterval}ms -> ${newInterval}ms")
+            Log.d(TAG, "Adjusting monitor interval: ${currentInterval}ms -> ${newInterval}ms")
             currentInterval = newInterval
         }
     }

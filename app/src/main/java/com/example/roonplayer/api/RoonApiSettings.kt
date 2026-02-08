@@ -36,13 +36,13 @@ class RoonApiSettings(
         private const val KEY_HAS_ERROR = "has_error"
         private const val LAYOUT_TYPE_ZONE = "zone"
         private const val OUTPUT_SETTING = KEY_ZONE
-        private const val OUTPUT_TITLE = "选择播放区域"
+        private const val OUTPUT_TITLE = "Select playback zone"
 
         /**
          * 当我们只有 output_id（例如首次升级到该版本）时，仍然需要给 zone 控件一个可显示的名称，
          * 否则 Roon UI 可能会把当前选择显示成空白，影响可用性与信任感。
          */
-        private const val FALLBACK_OUTPUT_NAME = "上次选择"
+        private const val FALLBACK_OUTPUT_NAME = "Last selection"
     }
     
     private var currentSettings = mutableMapOf<String, Any>()

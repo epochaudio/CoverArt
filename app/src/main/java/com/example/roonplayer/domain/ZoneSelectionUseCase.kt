@@ -26,7 +26,7 @@ class ZoneSelectionUseCase {
         if (availableZones.isEmpty()) {
             return ZoneSelectionDecision(
                 zoneId = null,
-                reason = "无可用区域",
+                reason = "No available zones",
                 persist = false
             )
         }
@@ -34,7 +34,7 @@ class ZoneSelectionUseCase {
         if (storedZoneId != null && availableZones.containsKey(storedZoneId)) {
             return ZoneSelectionDecision(
                 zoneId = storedZoneId,
-                reason = "存储配置",
+                reason = "Stored selection",
                 persist = false
             )
         }
@@ -43,16 +43,16 @@ class ZoneSelectionUseCase {
             val fallbackZoneId = autoSelectZoneId(availableZones)
             return ZoneSelectionDecision(
                 zoneId = fallbackZoneId,
-                reason = "配置失效回退",
+                reason = "Stored selection invalid (fallback)",
                 persist = false,
-                statusMessage = "⚠️ 配置的Zone不可用，正在回退到可用区域"
+                statusMessage = "⚠️ Saved zone is unavailable. Falling back to an available zone."
             )
         }
 
         if (currentZoneId != null && availableZones.containsKey(currentZoneId)) {
             return ZoneSelectionDecision(
                 zoneId = currentZoneId,
-                reason = "当前选择",
+                reason = "Current selection",
                 persist = false
             )
         }
@@ -60,7 +60,7 @@ class ZoneSelectionUseCase {
         val autoZoneId = autoSelectZoneId(availableZones)
         return ZoneSelectionDecision(
             zoneId = autoZoneId,
-            reason = "自动选择",
+            reason = "Auto-selected",
             persist = true
         )
     }

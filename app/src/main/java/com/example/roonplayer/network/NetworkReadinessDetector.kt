@@ -30,11 +30,11 @@ class NetworkReadinessDetector(
     private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     suspend fun waitForNetworkReady(timeoutMs: Long): NetworkState = withContext(Dispatchers.IO) {
-        Log.d(TAG, "开始检测网络就绪状态")
+        Log.d(TAG, "Starting network readiness check")
 
         val currentState = getCurrentNetworkState()
         if (currentState is NetworkState.Available) {
-            Log.i(TAG, "网络已就绪")
+            Log.i(TAG, "Network is ready")
             return@withContext currentState
         }
 
@@ -44,27 +44,27 @@ class NetworkReadinessDetector(
                     val state = getCurrentNetworkState()
                     when (state) {
                         is NetworkState.Available -> {
-                            Log.i(TAG, "网络检测完成，状态就绪")
+                            Log.i(TAG, "Network check complete: ready")
                             return@withTimeout state
                         }
                         is NetworkState.NotAvailable -> {
-                            Log.d(TAG, "网络不可用，继续等待...")
+                            Log.d(TAG, "Network unavailable, waiting...")
                         }
                         is NetworkState.Connecting -> {
-                            Log.d(TAG, "网络连接中，继续等待...")
+                            Log.d(TAG, "Network connecting, waiting...")
                         }
                         is NetworkState.Error -> {
-                            Log.w(TAG, "网络检测错误: ${state.message}")
+                            Log.w(TAG, "Network check error: ${state.message}")
                         }
                     }
                     delay(networkReadyPollIntervalMs)
                 }
                 @Suppress("UNREACHABLE_CODE")
-                NetworkState.Error("检测循环异常退出")
+                NetworkState.Error("Network readiness loop exited unexpectedly")
             }
         } catch (e: TimeoutCancellationException) {
-            Log.w(TAG, "网络就绪检测超时")
-            NetworkState.Error("网络检测超时，请检查网络连接")
+            Log.w(TAG, "Network readiness check timed out")
+            NetworkState.Error("Network check timed out. Please check your network connection.")
         }
     }
 
@@ -94,8 +94,8 @@ class NetworkReadinessDetector(
             return@withContext NetworkState.Available
 
         } catch (e: Exception) {
-            Log.e(TAG, "获取网络状态时发生错误", e)
-            return@withContext NetworkState.Error("网络状态检测失败: ${e.message}")
+            Log.e(TAG, "Error while getting network state", e)
+            return@withContext NetworkState.Error("Failed to check network state: ${e.message}")
         }
     }
 
@@ -108,7 +108,7 @@ class NetworkReadinessDetector(
                 true
             }
         } catch (e: Exception) {
-            Log.d(TAG, "连通性测试失败: ${e.message}")
+            Log.d(TAG, "Connectivity test failed: ${e.message}")
             false
         }
     }
@@ -123,7 +123,7 @@ class NetworkReadinessDetector(
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "网络变为可用")
+                Log.d(TAG, "Network became available")
                 callbackScope.launch {
                     val state = getCurrentNetworkState()
                     onNetworkChange(state)
@@ -131,12 +131,12 @@ class NetworkReadinessDetector(
             }
 
             override fun onLost(network: Network) {
-                Log.d(TAG, "网络连接丢失")
+                Log.d(TAG, "Network connection lost")
                 onNetworkChange(NetworkState.NotAvailable)
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                Log.d(TAG, "网络能力发生变化")
+                Log.d(TAG, "Network capabilities changed")
                 callbackScope.launch {
                     val state = getCurrentNetworkState()
                     onNetworkChange(state)

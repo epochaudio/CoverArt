@@ -19,7 +19,7 @@ class ZoneSelectionUseCaseTest {
         )
 
         assertNull(decision.zoneId)
-        assertEquals("无可用区域", decision.reason)
+        assertEquals("No available zones", decision.reason)
         assertFalse(decision.persist)
     }
 
@@ -37,7 +37,7 @@ class ZoneSelectionUseCaseTest {
         )
 
         assertEquals("zone_a", decision.zoneId)
-        assertEquals("存储配置", decision.reason)
+        assertEquals("Stored selection", decision.reason)
         assertFalse(decision.persist)
         assertNull(decision.statusMessage)
     }
@@ -56,9 +56,9 @@ class ZoneSelectionUseCaseTest {
         )
 
         assertEquals("zone_b", decision.zoneId)
-        assertEquals("配置失效回退", decision.reason)
+        assertEquals("Stored selection invalid (fallback)", decision.reason)
         assertFalse(decision.persist)
-        assertTrue(decision.statusMessage?.contains("回退") == true)
+        assertTrue(decision.statusMessage?.contains("Falling back") == true)
     }
 
     @Test
@@ -75,7 +75,7 @@ class ZoneSelectionUseCaseTest {
         )
 
         assertEquals("zone_a", decision.zoneId)
-        assertEquals("当前选择", decision.reason)
+        assertEquals("Current selection", decision.reason)
         assertFalse(decision.persist)
     }
 
@@ -94,7 +94,7 @@ class ZoneSelectionUseCaseTest {
         )
 
         assertEquals("zone_b", decision.zoneId)
-        assertEquals("自动选择", decision.reason)
+        assertEquals("Auto-selected", decision.reason)
         assertTrue(decision.persist)
     }
 

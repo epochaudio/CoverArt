@@ -25,3 +25,6 @@ local.properties
 # Generated artifacts
 app/release/
 app/build/
+
+# Local APK builds
+*.apk

@@ -42,24 +42,24 @@ class SmartConnectionManager(
         onStatusUpdate: (String) -> Unit = {}
     ): ConnectionResult = withContext(Dispatchers.IO) {
         
-        onStatusUpdate("检测网络连接状态...")
-        Log.i(TAG, "开始智能连接到 $ip:$port")
+        onStatusUpdate("Checking network connection...")
+        Log.i(TAG, "Starting smart connect to $ip:$port")
 
         val networkState = networkDetector.waitForNetworkReady(networkReadyTimeoutMs)
         when (networkState) {
             is NetworkReadinessDetector.NetworkState.NotAvailable -> {
-                onStatusUpdate("网络不可用，请检查网络连接")
-                return@withContext ConnectionResult.NetworkNotReady("网络连接不可用")
+                onStatusUpdate("Network unavailable. Please check your connection.")
+                return@withContext ConnectionResult.NetworkNotReady("Network is unavailable")
             }
             is NetworkReadinessDetector.NetworkState.Error -> {
-                onStatusUpdate("网络检测失败: ${networkState.message}")
+                onStatusUpdate("Network check failed: ${networkState.message}")
                 return@withContext ConnectionResult.NetworkNotReady(networkState.message)
             }
             is NetworkReadinessDetector.NetworkState.Connecting -> {
-                onStatusUpdate("网络连接中，继续等待...")
+                onStatusUpdate("Network connecting, waiting...")
             }
             is NetworkReadinessDetector.NetworkState.Available -> {
-                onStatusUpdate("网络已就绪，开始连接...")
+                onStatusUpdate("Network ready. Connecting...")
             }
         }
 
@@ -67,22 +67,22 @@ class SmartConnectionManager(
         var retryDelay = initialRetryDelayMs
 
         for (attempt in 1..maxRetryAttempts) {
-            onStatusUpdate("正在连接... (尝试 $attempt/$maxRetryAttempts)")
-            Log.d(TAG, "连接尝试 $attempt/$maxRetryAttempts 到 $ip:$port")
+            onStatusUpdate("Connecting... (attempt $attempt/$maxRetryAttempts)")
+            Log.d(TAG, "Connection attempt $attempt/$maxRetryAttempts to $ip:$port")
 
             when (val result = connectionValidator.validateConnection(ip, port)) {
                 is RoonConnectionValidator.ConnectionResult.Success -> {
-                    onStatusUpdate("连接成功！")
-                    Log.i(TAG, "成功连接到 $ip:$port")
+                    onStatusUpdate("Connected.")
+                    Log.i(TAG, "Successfully connected to $ip:$port")
                     return@withContext ConnectionResult.Success
                 }
                 
                 is RoonConnectionValidator.ConnectionResult.NetworkError -> {
                     lastError = result.message
-                    Log.w(TAG, "网络错误 (尝试 $attempt): $lastError")
+                    Log.w(TAG, "Network error (attempt $attempt): $lastError")
                     
                     if (attempt < maxRetryAttempts) {
-                        onStatusUpdate("连接失败，${retryDelay/1000}秒后重试...")
+                        onStatusUpdate("Connection failed. Retrying in ${retryDelay / 1000}s...")
                         delay(retryDelay)
                         retryDelay = min(retryDelay * 2, maxRetryDelayMs)
                     }
@@ -90,10 +90,10 @@ class SmartConnectionManager(
                 
                 is RoonConnectionValidator.ConnectionResult.Timeout -> {
                     lastError = result.message
-                    Log.w(TAG, "连接超时 (尝试 $attempt): $lastError")
+                    Log.w(TAG, "Connection timeout (attempt $attempt): $lastError")
                     
                     if (attempt < maxRetryAttempts) {
-                        onStatusUpdate("连接超时，${retryDelay/1000}秒后重试...")
+                        onStatusUpdate("Connection timed out. Retrying in ${retryDelay / 1000}s...")
                         delay(retryDelay)
                         retryDelay = min(retryDelay * 2, maxRetryDelayMs)
                     }
@@ -101,16 +101,16 @@ class SmartConnectionManager(
                 
                 is RoonConnectionValidator.ConnectionResult.InvalidCore -> {
                     lastError = result.message
-                    Log.e(TAG, "无效的Roon Core: $lastError")
-                    onStatusUpdate("连接失败: $lastError")
+                    Log.e(TAG, "Invalid Roon Core: $lastError")
+                    onStatusUpdate("Connection failed: $lastError")
                     return@withContext ConnectionResult.Failed(lastError, canRetry = false)
                 }
             }
         }
 
-        onStatusUpdate("连接失败，已达到最大重试次数")
-        Log.e(TAG, "连接失败，已用尽所有重试机会。最后错误: $lastError")
-        return@withContext ConnectionResult.Failed("连接失败: $lastError", canRetry = true)
+        onStatusUpdate("Connection failed. Max retries reached.")
+        Log.e(TAG, "Connection failed. All retries exhausted. Last error: $lastError")
+        return@withContext ConnectionResult.Failed("Connection failed: $lastError", canRetry = true)
     }
 
     fun registerNetworkMonitoring(onNetworkChange: (NetworkReadinessDetector.NetworkState) -> Unit) {
